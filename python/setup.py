@@ -14,5 +14,6 @@ for root, _, files in os.walk('src/compliance_code_scanner'):
 
 # Keep __init__.py purely as python file for package resolution
 setup(
-    ext_modules=cythonize(extensions, compiler_directives={'language_level': "3"})
+    ext_modules=cythonize(extensions, compiler_directives={'language_level': "3"}),
+    options={'bdist_wheel': {'universal': True}}
 )
