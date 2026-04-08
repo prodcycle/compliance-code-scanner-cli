@@ -36,3 +36,530 @@ Compliance Code Scanner is a multi-framework, policy-as-code compliance scanner 
 Terraform (.tf), Kubernetes (.yaml), Docker (Dockerfile), Environment (.env),
 CI configs (GitHub Actions, GitLab CI), SQL (.sql), IAM policies (.json),
 Source code (.ts, .tsx, .js, .jsx, .py, .go, .java, .rb)
+
+---
+
+# Compliance Code Scanner API Details
+
+### CLI
+
+Scan repos from the command line. Table, JSON, SARIF, and LLM-prompt output formats.
+
+Programmatic `scan()`, `gate()`, and hook APIs for deep integration into your toolchain.
+
+Auto-configure compliance hooks for Claude Code, Cursor, Codex, Copilot, and Gemini.
+
+REST endpoints for real-time scanning. Perfect for CI/CD pipelines and coding agents.
+
+SOC 2, HIPAA, and NIST CSF with tiered policies.
+
+OPA/Rego and Cedar engines with 3-tier confidence system for infra and app code.
+
+```bash
+npm install @prodcycle/compliance-code-scanner
+```
+
+## Quickstart
+
+Three steps to go from zero to a compliant codebase.
+
+```typescript
+import { scan, gate } from '@prodcycle/compliance-code-scanner';
+
+// Scan a repo
+const { report, exitCode } = await scan({
+  repoPath: '.',
+  frameworks: ['soc2', 'hipaa'],
+});
+
+console.log('Passed:', exitCode === 0);
+
+// Or scan code strings directly
+const result = await gate({
+  files: { 'main.tf': terraformCode },
+  frameworks: ['soc2'],
+});
+
+if (!result.passed) {
+  console.log(result.prompt); // LLM-ready fixes
+}
+```
+
+## Installation
+
+Available as an npm package. A Python package is coming soon. 
+Node.js ≥ 24 for the TypeScript SDK. Python SDK (≥ 3.10) is coming soon.
+
+```bash
+npm install @prodcycle/compliance-code-scanner
+```
+
+## CLI: Scan
+
+The default command. Walks a repository, collects infrastructure and source code artifacts, evaluates them against framework policies, and outputs a report.
+
+```bash
+# Basic scan
+compliance-code-scanner ./my-project
+
+# SOC 2 + HIPAA, JSON output
+compliance-code-scanner . \
+  --framework soc2,hipaa \
+  --format json \
+  --output report.json
+
+# SARIF for GitHub Code Scanning
+compliance-code-scanner . \
+  --format sarif \
+  --output results.sarif
+
+# Only Terraform files, high+ severity
+compliance-code-scanner . \
+  --include "**/*.tf,**/*.tfvars" \
+  --severity-threshold high
+
+# List all available frameworks
+compliance-code-scanner --list-frameworks
+```
+
+| Parameter | Type | Description |
+| --- | --- | --- |
+| repo_path | string | Path to the repository to scan |
+| --framework | string | Comma-separated framework IDs (default: soc2) |
+| --format | string | Output: json \| sarif \| table \| prompt (default: table) |
+| --severity-threshold | string | Minimum severity to include (default: low) |
+| --fail-on | string | Severities causing non-zero exit (default: critical,high) |
+| --include | string | Comma-separated glob patterns to include |
+| --exclude | string | Comma-separated glob patterns to exclude |
+| --output | string | Write report to file instead of stdout |
+| --api-key | string | API key for validation (or PC_API_KEY env) |
+| --list-frameworks | flag | List available frameworks and exit |
+
+### CLI: Hook
+
+Real-time post-edit scanning for AI coding agents. Two modes: local and API (sends files to hosted service).
+
+The hook reads agent tool output from stdin, extracts the edited file path, and only triggers a scan for infrastructure/source files. Non-scannable files (images, markdown, lock files) return exit code 0 immediately.
+
+0 = pass or non-infra file, 2 = violations found (remediation prompt written to stderr).
+
+```bash
+# Local hook (reads agent output from stdin)
+npx compliance-code-scanner --hook
+
+# With explicit file path
+npx compliance-code-scanner --hook --hook-file infra/main.tf
+
+# Multiple frameworks
+npx compliance-code-scanner --hook --framework soc2,hipaa
+```
+
+| Parameter | Type | Description |
+| --- | --- | --- |
+| --hook | flag | Run as local post-edit hook |
+| --hook-api | flag | Run as API-based hook (hosted scanning) |
+| --hook-file | string | Explicit file path (skips stdin parsing) |
+| --api-url | string | Compliance API base URL (or PC_API_URL) |
+| --api-key | string | API key (or PC_API_KEY) |
+| --framework | string | Frameworks to evaluate (default: soc2) |
+
+### CLI: Init
+
+One-command setup that auto-configures compliance hooks for your AI coding agents. Supports 6 agents out of the box.
+
+```bash
+# Configure all agents
+npx compliance-code-scanner --init
+
+# Hosted API mode
+npx compliance-code-scanner --init \
+  --agent claude-code,cursor,github-copilot \
+  --framework soc2,hipaa \
+  --api-url https://api.example.com
+```
+
+| Parameter | Type | Description |
+| --- | --- | --- |
+| --init | flag | Run agent setup wizard |
+| --agent | string | Comma-separated agents (default: all) |
+| --framework | string | Frameworks to configure (default: soc2) |
+| --api-url | string | Use hosted API mode |
+
+| Agent | Hook Type | Config |
+| --- | --- | --- |
+| claude-code | PostToolUse | .claude/settings.json |
+| cursor | afterFileEdit | .cursor/hooks.json |
+| codex | Instructions | AGENTS.md |
+| opencode | Instructions | AGENTS.md |
+| github-copilot | Instructions | .github/copilot-instructions.md |
+| gemini-cli | Instructions | GEMINI.md |
+
+## scan()
+
+Full repository scan. Walks the file system, collects artifacts, runs policy engines via API, and returns a structured report with findings and exit code.
+
+```typescript
+import {
+  scan,
+  Severity,
+  formatTable,
+  formatSarif,
+  formatPrompt,
+} from '@prodcycle/compliance-code-scanner';
+
+const response = await scan({
+  repoPath: '/path/to/repo',
+  frameworks: ['soc2', 'hipaa'],
+  options: {
+    severityThreshold: 'medium',
+    failOn: ['critical', 'high'],
+    include: ['**/*.tf', '**/*.yaml'],
+    exclude: ['**/test/**'],
+    config: {
+      application_code_tier3: true,
+    },
+  },
+});
+
+// Check result
+console.log('Passed:', response.exitCode === 0);
+console.log('Findings:', response.findings.length);
+
+// Format output
+const table = formatTable(response.report);
+const sarif = formatSarif(response.report);
+const prompt = formatPrompt(response.report);
+```
+
+| Parameter | Type | Description |
+| --- | --- | --- |
+| repoPath | string | Absolute or relative path to repository |
+| frameworks | string[] | Framework IDs to evaluate against |
+| options | ScanOptions | Configuration options (see below) |
+
+| Parameter | Type | Description |
+| --- | --- | --- |
+| severityThreshold | Severity | Minimum severity to include (default: LOW) |
+| failOn | Severity[] | Severities causing non-zero exit (default: [CRITICAL, HIGH]) |
+| include | string[] | Glob patterns to include |
+| exclude | string[] | Glob patterns to exclude |
+| config | Record<string, unknown> | Policy config overrides (e.g. { application_code_tier3: true }) |
+
+## gate()
+
+Scan code strings directly without writing files to disk. Accepts a map of file paths to contents, hits the hosted API, and cleans up. Ideal for LLM-generated code, API integrations, and test harnesses.
+
+```typescript
+import { gate } from '@prodcycle/compliance-code-scanner';
+
+const result = await gate({
+  files: {
+    'main.tf': `
+      resource "aws_s3_bucket" "data" {
+        bucket = "my-data-bucket"
+      }
+    `,
+    '.env': `
+      DB_PASSWORD=super_secret_123
+    `,
+  },
+  frameworks: ['soc2'],
+  severityThreshold: 'medium',
+});
+
+if (!result.passed) {
+  console.log(result.prompt);
+}
+```
+
+| Parameter | Type | Description |
+| --- | --- | --- |
+| files | Record<string, string> | Map of relative paths to file contents |
+| frameworks | string[] | Framework IDs (default: ["soc2"]) |
+| severityThreshold | Severity | Min severity (default: MEDIUM) |
+| failOn | Severity[] | Failure severities (default: [CRITICAL, HIGH]) |
+| config | Record<string, unknown> | Policy config overrides |
+
+| Parameter | Type | Description |
+| --- | --- | --- |
+| passed | boolean | Whether all checks passed |
+| exitCode | number | 0 = pass, 1 = failures, 2 = error |
+| findings | Finding[] | All findings above threshold |
+| prompt | string | Pre-formatted LLM remediation prompt |
+| summary | object | { total, passed, failed, bySeverity } |
+
+## runHook()
+
+Programmatic interface for the local post-edit hook. Reads the edited file path from stdin (agent tool output) or an explicit option, skips non-infrastructure files, and runs a scan if applicable.
+
+Returns Promise<number>: 0 = pass/skip, 2 = violations found.
+
+```typescript
+import { runHook } from '@prodcycle/compliance-code-scanner';
+
+const exitCode = await runHook({
+  frameworks: ['soc2', 'hipaa'],
+  filePath: 'infra/main.tf',
+});
+
+if (exitCode !== 0) {
+  console.error('Compliance violations detected');
+}
+```
+
+| Parameter | Type | Description |
+| --- | --- | --- |
+| frameworks | string[] | Frameworks to evaluate (default: ["soc2"]) |
+| filePath | string | Explicit file path (skips stdin) |
+| severityThreshold | Severity | Min severity (default: MEDIUM) |
+| failOn | Severity[] | Failure severities |
+
+## runHookApi()
+
+Hosted API hook. Collects all infrastructure files from the project directory and sends them to the compliance API for centralized scanning.
+
+```typescript
+import {
+  runHookApi,
+  collectInfraFiles,
+} from '@prodcycle/compliance-code-scanner';
+
+// Run API hook
+const exitCode = await runHookApi({
+  apiUrl: 'https://api.example.com',
+  apiKey: 'pc_your_key_here',
+  frameworks: ['soc2'],
+});
+```
+
+| Parameter | Type | Description |
+| --- | --- | --- |
+| frameworks | string[] | Frameworks to evaluate |
+| apiUrl | string | API URL (or PC_API_URL env) |
+| apiKey | string | API key (or PC_API_KEY env) |
+| filePath | string | Explicit file path (skips stdin) |
+
+## Formatters
+
+Four built-in formatters transform a ScanReport into different output formats.
+
+- Human-readable table
+- LLM-optimized prompt
+- SARIF 2.1.0 for GitHub Code Scanning
+- Full structured JSON
+
+```typescript
+import fs from 'node:fs';
+import {
+  scan,
+  formatTable,
+  formatPrompt,
+  formatSarif,
+} from '@prodcycle/compliance-code-scanner';
+
+const { report } = await scan({
+  repoPath: '.',
+  frameworks: ['soc2'],
+});
+
+// Human-readable table
+console.log(formatTable(report));
+
+// LLM-ready prompt (feed to AI agent)
+const prompt = formatPrompt(report);
+
+// SARIF for GitHub
+const sarif = formatSarif(report);
+fs.writeFileSync('results.sarif', JSON.stringify(sarif, null, 2));
+
+// Structured JSON
+const json = report.toJson();
+```
+
+## Agent Integration
+
+The scanner creates a self-healing compliance loop with AI coding agents. After every file write, the agent hook scans for violations and returns structured remediation instructions that the agent automatically applies.
+
+Hook agents (Claude Code, Cursor) run scans automatically. Instruction agents (Codex, OpenCode, GitHub Copilot, Gemini CLI) receive a prompt telling them to run the scanner manually.
+
+```bash
+# One command to set up everything
+npx compliance-code-scanner --init
+```
+
+## API Reference
+
+Accepts a map of file paths to contents. Non-scannable files (images, markdown, lock files) return passed: true immediately with zero latency cost.
+
+Designed for incremental agent scans, not full codebase scans. Limit: 500 files, 5MB payload. For full codebase scanning, use the CLI locally.
+
+```bash
+curl -X POST https://api.prodcycle.com/v1/compliance/hook \
+  -H "Authorization: Bearer pc_your_key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "files": {
+      "main.tf": "resource \"aws_s3_bucket\" \"data\" {\n  bucket = \"my-bucket\"\n}",
+      ".env": "DB_PASSWORD=changeme"
+    },
+    "frameworks": ["soc2"]
+  }'
+```
+
+```json
+{
+  "passed": false,
+  "findings": [
+    {
+      "control_id": "SOC2-2.1-01",
+      "severity": "high",
+      "confidence": "high",
+      "resource_type": "s3_bucket",
+      "resource_path": "main.tf",
+      "resource_name": "data",
+      "message": "S3 bucket 'data' has no encryption at rest configured",
+      "remediation": "Add aws_s3_bucket_server_side_encryption_configuration with aws:kms",
+      "advisory": false,
+      "line": 1,
+      "end_line": 3,
+      "engine": "rego",
+      "framework": "soc2"
+    }
+  ],
+  "prompt": "Fix the following compliance violations..."
+}
+```
+
+| Parameter | Type | Description |
+| --- | --- | --- |
+| files | Record<string, string> | Map of file paths to contents (max 500 files) |
+| frameworks | string[] | Frameworks to evaluate (default: ["soc2"]) |
+| product_id | string (uuid) | Associate scan with a product |
+
+| Parameter | Type | Description |
+| --- | --- | --- |
+| passed | boolean | Whether all checks passed |
+| findings | Finding[] | Violation details (includes line/end_line) |
+| prompt | string | LLM-ready remediation instructions |
+| scanId | string | UUID of the persisted scan record |
+
+Same input as /hook but designed for CI pipelines. Same limits apply (500 files, 5MB). For full repo scans in CI, use the CLI directly.
+
+```yaml
+name: Compliance Scan
+on: pull_request
+
+jobs:
+  compliance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Run compliance scan
+        run: npx compliance-code-scanner . \
+          --framework soc2,hipaa \
+          --format sarif \
+          --output results.sarif
+
+      - name: Upload SARIF results
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results.sarif
+```
+
+### API Key Management
+
+API keys use the `pc_` prefix (64 hex characters). Keys are scoped to a workspace and support both cookie-based JWT auth and standalone Bearer token auth.
+
+```bash
+# Create API key
+curl -X POST https://api.prodcycle.com/v1/compliance/api-keys \
+  -H "Authorization: Bearer <jwt_token>" \
+  -H "Content-Type: application/json" \
+  -d '{ "description": "CI pipeline" }'
+
+# List keys
+curl https://api.prodcycle.com/v1/compliance/api-keys \
+  -H "Authorization: Bearer <jwt_token>"
+
+# Revoke
+curl -X DELETE https://api.prodcycle.com/v1/compliance/api-keys/key_id \
+  -H "Authorization: Bearer <jwt_token>"
+```
+
+## Frameworks Reference
+
+Three compliance frameworks ship with the scanner and include full automated OPA/Rego + Cedar policies.
+
+| Framework | ID | Policies |
+| --- | --- | --- |
+| SOC 2 | soc2 | Full |
+| HIPAA | hipaa | Full |
+| NIST CSF 2.0 | nist-csf | Full |
+
+## Policy Tiers
+
+Application code policies use a three-tier confidence system. Only Tier 1 and 2 are enabled by default. Tier 3 requires explicit opt-in.
+
+Tier 3 findings are marked advisory with a “do NOT auto-remediate” label so AI agents don't attempt fixes that could introduce regressions.
+
+```typescript
+// Enable Tier 3 via gate()
+const result = await gate({
+  files: { 'service.ts': code },
+  config: { application_code_tier3: true },
+});
+
+// Enable Tier 3 via scan()
+const response = await scan({
+  repoPath: '.',
+  frameworks: ['soc2'],
+  options: {
+    config: { application_code_tier3: true },
+  },
+});
+```
+
+## Severity Levels
+
+Four severity levels, ordered by impact. By default, only critical and high findings cause a non-zero exit code.
+
+- `critical`
+- `high`
+- `medium`
+- `low`
+
+## Supported File Types
+
+The collector walks the repository and extracts normalized resource objects from these file types. Files in `node_modules`, `.terraform`, `vendor`, and `__pycache__` are always skipped.
+
+| Type | Extensions | Extracted |
+| --- | --- | --- |
+| Terraform | .tf, .tf.json | Resource blocks → typed objects |
+| Kubernetes | .yaml, .yml | Manifests → kind-based types |
+| Docker | Dockerfile* | Base images, ports, content |
+| Environment | .env, .env.* | Key-value pairs |
+| CI Configs | GH Actions, GitLab CI, etc. | Jobs, steps, environments |
+| SQL | .sql | Migration content |
+| IAM Policies | .json (with Statement) | Actions, effects, resources |
+| Source Code | .ts .tsx .js .jsx .py .go .java .rb | Content for pattern matching |
+
+## Environment Variables
+
+All environment variables are optional. CLI flags take precedence when both are set.
+
+```bash
+# Example .env setup
+export PC_API_URL=https://api.prodcycle.com
+export PC_API_KEY=pc_a1b2c3d4e5f6...
+```
+
+| Variable | Description |
+| --- | --- |
+| PC_API_KEY | API key for hosted scanning (pc_… prefix) |
+| PC_API_URL | Base URL for hosted compliance API |
+| CLAUDE_PROJECT_DIR | Project root for Claude Code hooks (fallback: cwd) |
