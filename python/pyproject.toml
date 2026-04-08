@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "compliance-code-scanner"
+version = "0.1.0"
+description = "Multi-framework policy-as-code compliance scanner for infrastructure and application code."
+readme = "../README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "ProdCycle, Inc.", email = "engineering@prodcycle.com"},
+]
+keywords = ["compliance", "soc2", "hipaa", "nist", "cli", "security"]
+
+[project.scripts]
+compliance-code-scanner = "compliance_code_scanner.cli:main"
+
+[project.urls]
+Homepage = "https://prodcycle.com"
+Documentation = "https://docs.prodcycle.com"
+Repository = "https://github.com/prodcycle/compliance-code-scanner-cli"
