@@ -90,7 +90,7 @@ API keys are created through the ProdCycle dashboard.
 
 ## Requirements
 
-- Node.js >= 20.0.0
+- Node.js >= 24.0.0
 
 ## License
 
