@@ -31,4 +31,4 @@ prodcycle = "prodcycle.cli:main"
 [project.urls]
 Homepage = "https://prodcycle.com"
 Documentation = "https://docs.prodcycle.com"
-Repository = "https://github.com/prodcycle/prodcycle-cli"
+Repository = "https://github.com/prodcycle/cli"

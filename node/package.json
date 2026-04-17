@@ -5,10 +5,10 @@
   "homepage": "https://docs.prodcycle.com",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/prodcycle/prodcycle-cli.git"
+    "url": "git+https://github.com/prodcycle/cli.git"
   },
   "bugs": {
-    "url": "https://github.com/prodcycle/prodcycle-cli/issues"
+    "url": "https://github.com/prodcycle/cli/issues"
   },
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
