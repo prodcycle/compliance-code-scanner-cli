@@ -32,14 +32,20 @@ npm install @prodcycle/prodcycle
 
 ```bash
 # Scan current directory against SOC 2 and HIPAA
-prodcycle . --framework soc2,hipaa
+prodcycle scan . --framework soc2,hipaa
 
 # Output as SARIF for GitHub Code Scanning
-prodcycle . --framework soc2 --format sarif --output results.sarif
+prodcycle scan . --framework soc2 --format sarif --output results.sarif
 
 # Set severity threshold (only report HIGH and above)
-prodcycle . --framework hipaa --severity-threshold high
+prodcycle scan . --framework hipaa --severity-threshold high
+
+# Auto-configure compliance hooks/instructions for your coding agents
+# (Claude Code, Cursor, Codex, OpenCode, GitHub Copilot, Gemini CLI)
+prodcycle init --agent all
 ```
+
+Subcommands: `scan` (full repo scan), `gate` (JSON payload from stdin), `hook` (coding-agent post-edit hook), `init` (agent setup).
 
 ### Programmatic API
 
