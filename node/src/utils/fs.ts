@@ -1,80 +1,133 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { glob } from 'glob';
+import { minimatch } from 'minimatch';
 
 const MAX_FILE_SIZE = 256 * 1024; // 256 KB
 const MAX_TOTAL_FILES = 10_000;
 
-export async function collectFiles(
-  baseDir: string,
-  includePatterns?: string[],
-  excludePatterns?: string[]
-): Promise<Record<string, string>> {
-  // Simple implementation using glob
-  const patterns = includePatterns && includePatterns.length > 0 ? includePatterns : ['**/*'];
-  const ignore = [
-    'node_modules/**',
-    '.git/**',
-    '.terraform/**',
-    'dist/**',
-    'build/**',
-    '**/__pycache__/**',
-    '.next/**',
-    '.nuxt/**',
-    'vendor/**',
-    'coverage/**',
-    '.venv/**',
-    'venv/**',
-    '.tox/**',
-    'target/**',
-    '*.lock',
-    'package-lock.json',
-    '*.min.js',
-    '*.min.css',
-    '*.map',
-    '*.bundle.js',
-    '*.tfstate',
-    '*.tfstate.backup',
-  ];
-  
-  if (excludePatterns && excludePatterns.length > 0) {
-    ignore.push(...excludePatterns);
+/**
+ * Directories skipped unconditionally. Kept in parity with
+ * `packages/compliance-code-scanner/src/ignore-utils.ts`.
+ */
+const SKIP_DIRS = new Set([
+  'node_modules',
+  'vendor',
+  '__pycache__',
+  '.terraform',
+  '.git',
+  'dist',
+  '.venv',
+  'venv',
+  'build',
+  'out',
+  '.next',
+  '.nuxt',
+  '.output',
+  '.cache',
+  '.parcel-cache',
+  'coverage',
+  '.nyc_output',
+  '.turbo',
+  'target',
+  '.gradle',
+  '.mvn',
+  '.idea',
+  '.vscode',
+  '.eggs',
+  '.tox',
+  '.mypy_cache',
+  '.ruff_cache',
+  '.pytest_cache',
+  'bower_components',
+  '.svn',
+  '.hg',
+  '__snapshots__',
+]);
+
+const SKIP_DIR_SUFFIXES = ['.egg-info'];
+
+const SKIP_FILE_EXTENSIONS = ['.lock', '.min.js', '.min.css', '.map', '.bundle.js', '.tfstate', '.tfstate.backup'];
+const SKIP_FILE_NAMES = new Set(['package-lock.json']);
+
+/**
+ * Load .gitignore patterns from the repo root.
+ *
+ * Negation patterns (`!foo`) are dropped — minimatch does not interpret them
+ * as gitignore would, and passing them through causes directory-wide blindness
+ * (see server-side fix in ignore-utils.ts).
+ */
+function loadGitignore(repoPath: string): string[] {
+  try {
+    const gitignorePath = path.join(repoPath, '.gitignore');
+    if (!fs.existsSync(gitignorePath)) return [];
+    const content = fs.readFileSync(gitignorePath, 'utf-8');
+    return content
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line && !line.startsWith('#') && !line.startsWith('!'))
+      .map((line) => (line.endsWith('/') ? line.slice(0, -1) : line));
+  } catch {
+    return [];
+  }
+}
+
+function matchesAny(filePath: string, patterns: string[]): boolean {
+  return patterns.some((p) => minimatch(filePath, p));
+}
+
+/**
+ * Decide whether a directory or file entry should be excluded from collection.
+ * Mirrors server `shouldIgnore` so scanner results stay consistent between
+ * client-collected (CLI) and server-collected paths.
+ */
+function shouldIgnore(
+  name: string,
+  relPath: string,
+  ignores: string[],
+  userExcludes?: string[],
+): boolean {
+  if (
+    SKIP_DIRS.has(name) ||
+    SKIP_DIR_SUFFIXES.some((s) => name.endsWith(s)) ||
+    (name.startsWith('.') &&
+      !name.startsWith('.env') &&
+      !name.startsWith('.github') &&
+      !name.startsWith('.gitlab'))
+  ) {
+    return true;
   }
 
-  const matches = await glob(patterns, {
-    cwd: baseDir,
-    ignore,
-    nodir: true,
-  });
-
-  const files: Record<string, string> = {};
-  let count = 0;
-
-  for (const match of matches) {
-    if (count >= MAX_TOTAL_FILES) {
-      console.warn(`Reached max file limit (${MAX_TOTAL_FILES}). Some files were skipped.`);
-      break;
+  if (userExcludes && userExcludes.length > 0) {
+    for (const pattern of userExcludes) {
+      if (
+        name === pattern ||
+        name + '/' === pattern ||
+        relPath === pattern ||
+        relPath + '/' === pattern
+      ) {
+        return true;
+      }
     }
-
-    const fullPath = path.join(baseDir, match);
-    const stats = fs.statSync(fullPath);
-    
-    // Skip large files
-    if (stats.size > MAX_FILE_SIZE) {
-      continue;
-    }
-
-    // Basic heuristic to skip binary files
-    const buffer = fs.readFileSync(fullPath);
-    if (isBinary(buffer)) {
-      continue;
-    }
-
-    files[match] = buffer.toString('utf8');
-    count++;
+    if (matchesAny(relPath, userExcludes)) return true;
   }
 
-  return files;
+  // .env* files are always scanned, even if listed in .gitignore (common case)
+  if (name.startsWith('.env') || name.endsWith('.env')) return false;
+
+  for (const pattern of ignores) {
+    if (
+      name === pattern ||
+      name + '/' === pattern ||
+      relPath === pattern ||
+      relPath + '/' === pattern
+    ) {
+      return true;
+    }
+  }
+
+  if (matchesAny(relPath, ignores)) return true;
+
+  return false;
 }
 
 function isBinary(buffer: Buffer): boolean {
@@ -82,4 +135,92 @@ function isBinary(buffer: Buffer): boolean {
     if (buffer[i] === 0) return true;
   }
   return false;
+}
+
+function shouldSkipFileByName(name: string): boolean {
+  if (SKIP_FILE_NAMES.has(name)) return true;
+  return SKIP_FILE_EXTENSIONS.some((ext) => name.endsWith(ext));
+}
+
+export async function collectFiles(
+  baseDir: string,
+  includePatterns?: string[],
+  excludePatterns?: string[],
+): Promise<Record<string, string>> {
+  const repoRoot = path.resolve(baseDir);
+  const ignores = loadGitignore(repoRoot);
+  const files: Record<string, string> = {};
+  const state = { count: 0, limitReached: false };
+
+  walk(repoRoot, repoRoot, ignores, includePatterns, excludePatterns, files, state);
+
+  return files;
+}
+
+function walk(
+  dir: string,
+  repoRoot: string,
+  ignores: string[],
+  includePatterns: string[] | undefined,
+  userExcludes: string[] | undefined,
+  files: Record<string, string>,
+  state: { count: number; limitReached: boolean },
+): void {
+  if (state.limitReached) return;
+
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+
+  for (const entry of entries) {
+    if (state.limitReached) return;
+
+    const name = entry.name;
+    const fullPath = path.join(dir, name);
+    const relPath = path.relative(repoRoot, fullPath);
+
+    if (entry.isDirectory()) {
+      if (shouldIgnore(name, relPath, ignores, userExcludes)) continue;
+      walk(fullPath, repoRoot, ignores, includePatterns, userExcludes, files, state);
+      continue;
+    }
+
+    if (!entry.isFile()) continue;
+    if (shouldIgnore(name, relPath, ignores, userExcludes)) continue;
+    if (shouldSkipFileByName(name)) continue;
+
+    if (includePatterns && includePatterns.length > 0 && !matchesAny(relPath, includePatterns)) {
+      continue;
+    }
+
+    if (state.count >= MAX_TOTAL_FILES) {
+      console.warn(`Reached max file limit (${MAX_TOTAL_FILES}). Some files were skipped.`);
+      state.limitReached = true;
+      return;
+    }
+
+    let stats: fs.Stats;
+    try {
+      stats = fs.statSync(fullPath);
+    } catch {
+      continue;
+    }
+
+    if (stats.size > MAX_FILE_SIZE) continue;
+
+    let buffer: Buffer;
+    try {
+      buffer = fs.readFileSync(fullPath);
+    } catch {
+      continue;
+    }
+
+    if (isBinary(buffer)) continue;
+
+    files[relPath] = buffer.toString('utf8');
+    state.count++;
+  }
 }
