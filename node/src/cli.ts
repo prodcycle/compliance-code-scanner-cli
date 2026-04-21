@@ -71,7 +71,7 @@ program
   .description(
     'Multi-framework policy-as-code compliance scanner for infrastructure and application code.',
   )
-  .version('0.2.2');
+  .version('0.3.0');
 
 // ── scan ────────────────────────────────────────────────────────────────────
 program
