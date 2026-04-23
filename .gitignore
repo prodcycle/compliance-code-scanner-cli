@@ -8,6 +8,9 @@ python/build/
 python/*.egg-info/
 python/**/__pycache__/
 python/**/*.pyc
+# Cython intermediate output — we ship pure .py, .c files are build artifacts
+python/src/**/*.c
+python/src/**/*.so
 
 # OS
 .DS_Store
