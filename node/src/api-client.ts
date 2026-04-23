@@ -46,10 +46,15 @@ export class ComplianceApiClient {
     });
   }
 
-  async hook(files: Record<string, string>, frameworks: string[]) {
+  async hook(files: Record<string, string>, frameworks: string[], options: ScanOptions = {}) {
     return this.post('/v1/compliance/hook', {
       files,
       frameworks,
+      options: {
+        severity_threshold: options.severityThreshold,
+        fail_on: options.failOn,
+        ...options.config,
+      },
     });
   }
 

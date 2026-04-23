@@ -4,6 +4,8 @@ from .formatters.table import format_table
 from .formatters.prompt import format_prompt
 from .formatters.sarif import format_sarif
 
+__version__ = "0.4.1"
+
 __all__ = [
     'ComplianceApiClient',
     'scan',
@@ -11,6 +13,7 @@ __all__ = [
     'format_table',
     'format_prompt',
     'format_sarif',
+    '__version__',
 ]
 
 def scan(repo_path: str, frameworks: list[str] = None, options: dict = None) -> dict:
@@ -51,15 +54,24 @@ def gate(files: dict, frameworks: list[str] = None, severity_threshold: str = "m
         frameworks = ['soc2']
     if fail_on is None:
         fail_on = ["critical", "high"]
-        
+
     client = ComplianceApiClient(api_url, api_key)
-    
-    # We call the hook API since we don't have the full validate structure locally
-    # Gate typically is for real-time analysis
-    response = client.hook(files, frameworks)
-    
+
+    # Forward severityThreshold/failOn/config to the hook endpoint so callers
+    # of the programmatic API can influence server-side filtering the same way
+    # scan() does.
+    response = client.hook(
+        files,
+        frameworks,
+        options={
+            "severityThreshold": severity_threshold,
+            "failOn": fail_on,
+            "config": config or {},
+        },
+    )
+
     passed = response.get('passed', False)
-    
+
     return {
         'passed': passed,
         'exitCode': 0 if passed else 1,

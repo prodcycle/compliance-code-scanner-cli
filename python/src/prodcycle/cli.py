@@ -3,7 +3,7 @@ import json
 import os
 import sys
 
-from prodcycle import scan, gate
+from prodcycle import scan, gate, __version__
 from prodcycle.formatters.table import format_table
 from prodcycle.formatters.sarif import format_sarif
 from prodcycle.formatters.prompt import format_prompt
@@ -475,6 +475,11 @@ def main():
     parser = argparse.ArgumentParser(
         prog='prodcycle',
         description='Multi-framework policy-as-code compliance scanner for infrastructure and application code.',
+    )
+    parser.add_argument(
+        '-V', '--version',
+        action='version',
+        version=f'%(prog)s {__version__}',
     )
     subparsers = parser.add_subparsers(dest='command', required=True)
 

@@ -29,10 +29,20 @@ class ComplianceApiClient:
         }
         return self._post('/v1/compliance/validate', data)
 
-    def hook(self, files, frameworks):
+    def hook(self, files, frameworks, options=None):
+        options = options or {}
+
+        opts_payload = {
+            "severity_threshold": options.get("severityThreshold"),
+            "fail_on": options.get("failOn"),
+        }
+        if "config" in options and isinstance(options["config"], dict):
+            opts_payload.update(options["config"])
+
         data = {
             "files": files,
-            "frameworks": frameworks
+            "frameworks": frameworks,
+            "options": opts_payload,
         }
         return self._post('/v1/compliance/hook', data)
 

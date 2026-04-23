@@ -45,10 +45,10 @@ export async function scan(params: {
  */
 export async function gate(options: GateOptions) {
   const { files, frameworks = ['soc2'], ...scanOpts } = options;
-  
+
   const client = new ComplianceApiClient(options.apiUrl, options.apiKey);
-  const response = await client.hook(files, frameworks);
-  
+  const response = await client.hook(files, frameworks, scanOpts);
+
   return {
     passed: response.passed,
     exitCode: response.passed ? 0 : 1,

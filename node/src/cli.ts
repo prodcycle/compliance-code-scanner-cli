@@ -66,12 +66,23 @@ function parseList(val?: string): string[] | undefined {
 
 const program = new Command();
 
+// Load version from package.json at runtime so CLI --version stays in sync with
+// the published package version without requiring a source edit per release.
+const PKG_VERSION: string = (() => {
+  try {
+    const pkgPath = path.join(__dirname, '..', 'package.json');
+    return JSON.parse(fs.readFileSync(pkgPath, 'utf-8')).version ?? '0.0.0';
+  } catch {
+    return '0.0.0';
+  }
+})();
+
 program
   .name('prodcycle')
   .description(
     'Multi-framework policy-as-code compliance scanner for infrastructure and application code.',
   )
-  .version('0.4.0');
+  .version(PKG_VERSION);
 
 // ── scan ────────────────────────────────────────────────────────────────────
 program
