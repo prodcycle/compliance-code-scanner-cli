@@ -4,7 +4,7 @@ from .formatters.table import format_table
 from .formatters.prompt import format_prompt
 from .formatters.sarif import format_sarif
 
-__version__ = "0.4.1"
+__version__ = "0.4.2"
 
 __all__ = [
     'ComplianceApiClient',
