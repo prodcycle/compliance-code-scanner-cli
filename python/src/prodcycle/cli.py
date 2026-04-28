@@ -59,6 +59,21 @@ def _add_common_scan_args(parser):
     parser.add_argument('--output', help='Write report to file')
     parser.add_argument('--api-url', help='Compliance API base URL (or PC_API_URL env)')
     parser.add_argument('--api-key', help='API key for compliance API (or PC_API_KEY env)')
+    # --async / --chunked select the scan submission mode. Default is sync
+    # with auto-fallback to chunked on 413 (the server tells us via
+    # error.details.suggestedEndpoint when /validate is too small).
+    parser.add_argument(
+        '--async',
+        action='store_true',
+        dest='use_async',
+        help='Use async-validate (server returns 202 immediately; CLI polls until COMPLETED). Useful for large scans where holding a connection isn\'t practical.',
+    )
+    parser.add_argument(
+        '--chunked',
+        action='store_true',
+        dest='use_chunked',
+        help='Force the chunked-session flow regardless of payload size. Default already auto-falls-back to chunked when /validate returns 413.',
+    )
 
 
 def _cmd_scan(args):
@@ -67,7 +82,21 @@ def _cmd_scan(args):
     fail_on = _parse_list(args.fail_on) or ['critical', 'high']
     fmt = args.format or 'table'
 
-    print(f"Scanning {os.path.abspath(repo_path)} for {', '.join(frameworks)}...", file=sys.stderr)
+    if args.use_async and args.use_chunked:
+        print('scan: --async and --chunked are mutually exclusive.', file=sys.stderr)
+        sys.exit(2)
+    if args.use_async:
+        mode = 'async'
+    elif args.use_chunked:
+        mode = 'chunked'
+    else:
+        mode = 'sync'
+
+    suffix = '' if mode == 'sync' else f' ({mode} mode)'
+    print(
+        f"Scanning {os.path.abspath(repo_path)} for {', '.join(frameworks)}{suffix}...",
+        file=sys.stderr,
+    )
 
     response = scan(
         repo_path=repo_path,
@@ -79,11 +108,47 @@ def _cmd_scan(args):
             'exclude': _parse_list(args.exclude),
             'apiUrl': args.api_url,
             'apiKey': args.api_key,
+            'config': {'mode': mode},
         },
     )
 
     _write_output(_render(response, fmt), args.output)
     sys.exit(response.get('exitCode', 1))
+
+
+def _cmd_scans(args):
+    """Fetch the current status + findings of a scan by ID.
+
+    Useful with --async to resume a poll loop after a CI step boundary,
+    or to inspect a chunked session that was abandoned mid-flight.
+    """
+    from .api_client import ComplianceApiClient
+
+    client = ComplianceApiClient(args.api_url, args.api_key)
+    scan_data = client.get_scan(args.scan_id)
+    fmt = args.format or 'json'
+
+    payload = {
+        'scanId': args.scan_id,
+        'passed': scan_data.get('passed', False),
+        'status': scan_data.get('status', 'COMPLETED'),
+        'findings': scan_data.get('findings', []),
+        'summary': scan_data.get('summary', {}),
+        'exitCode': 0 if scan_data.get('passed') else 1,
+    }
+
+    _write_output(_render(payload, fmt), args.output)
+
+    if scan_data.get('status') == 'IN_PROGRESS':
+        print(
+            f"Scan {args.scan_id} is still IN_PROGRESS. Re-run the same command "
+            f"to keep polling, or use 'prodcycle scan --async' to wait for "
+            f"completion.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    sys.exit(payload['exitCode'])
 
 
 def _cmd_gate(args):
@@ -488,6 +553,15 @@ def main():
     p_scan.add_argument('repo_path', nargs='?', default='.', help='Path to the repository to scan')
     _add_common_scan_args(p_scan)
     p_scan.set_defaults(func=_cmd_scan)
+
+    # scans <scanId> — fetch status + findings of any scan by ID
+    p_scans = subparsers.add_parser('scans', help='Get status + findings of a scan by ID')
+    p_scans.add_argument('scan_id', help='The scanId returned by `scan --async` or `scan --chunked`')
+    p_scans.add_argument('--format', default='json', help='Output format: json, sarif, table, prompt')
+    p_scans.add_argument('--output', help='Write report to file')
+    p_scans.add_argument('--api-url', help='Compliance API base URL (or PC_API_URL env)')
+    p_scans.add_argument('--api-key', help='API key for compliance API (or PC_API_KEY env)')
+    p_scans.set_defaults(func=_cmd_scans)
 
     # gate
     p_gate = subparsers.add_parser('gate', help='Evaluate a JSON payload of files from stdin')

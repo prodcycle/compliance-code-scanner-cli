@@ -17,16 +17,24 @@ __all__ = [
 ]
 
 def scan(repo_path: str, frameworks: list[str] = None, options: dict = None) -> dict:
+    """Scan a repository.
+
+    Modes (selectable via ``options['config']['mode']``):
+      - default ``'sync'``: synchronous validate; auto-falls-back to chunked
+        sessions on 413 with ``suggestedEndpoint='/v1/compliance/scans'``
+      - ``'async'``: kicks off ``?async=true`` and polls until terminal
+      - ``'chunked'``: explicit chunked-session flow regardless of size
+    """
     if frameworks is None:
         frameworks = ['soc2']
     if options is None:
         options = {}
-        
+
     include = options.get('include')
     exclude = options.get('exclude')
-    
+
     files = collect_files(repo_path, include_patterns=include, exclude_patterns=exclude)
-    
+
     if not files:
         return {
             'passed': True,
@@ -35,13 +43,21 @@ def scan(repo_path: str, frameworks: list[str] = None, options: dict = None) -> 
             'report': None,
             'summary': {}
         }
-        
+
     client = ComplianceApiClient(options.get('apiUrl'), options.get('apiKey'))
-    response = client.validate(files, frameworks, options)
-    
+    mode = ((options.get('config') or {}).get('mode')) or 'sync'
+
+    if mode == 'async':
+        response = client.validate_and_poll(files, frameworks, options)
+    elif mode == 'chunked':
+        response = client.validate_chunked(files, frameworks, options)
+    else:
+        response = client.validate(files, frameworks, options)
+
     passed = response.get('passed', False)
-    
+
     return {
+        'scanId': response.get('scanId'),
         'passed': passed,
         'exitCode': 0 if passed else 1,
         'findings': response.get('findings', []),
