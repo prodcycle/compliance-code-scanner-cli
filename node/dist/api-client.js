@@ -95,7 +95,7 @@ class ComplianceApiClient {
         if (!this.apiKey &&
             process.env.NODE_ENV !== 'test' &&
             !process.env.PC_SUPPRESS_WARNINGS) {
-            process.stderr.write('Warning: PC_API_KEY is not set. API calls will likely fail.\n');
+            logger.warn('PC_API_KEY is not set. API calls will likely fail.');
         }
     }
     /**
@@ -168,14 +168,18 @@ class ComplianceApiClient {
                 ...options.config,
             },
         }));
-        // Fallbacks are env-overridable so operators can tune chunk size
-        // independently of server hints (e.g. behind a proxy with stricter
-        // body limits than the server's announced cap).
-        const chunkBytes = serverHints.chunkSizeBytes ??
-            session.chunkSizeBytes ??
+        // The session response trumps the 413 hint: a 413 from /validate
+        // carries the /validate payload cap (5 MB), but the /chunks endpoint
+        // has its own (50 MB) cap that the freshly-opened session reports
+        // exactly. Using the stale 413 hint here would over-shrink chunks
+        // and trigger many unnecessary upload round-trips. Env vars are the
+        // last-ditch fallback for both, so operators can still cap below
+        // the server-reported max if they're behind a stricter proxy.
+        const chunkBytes = session.chunkSizeBytes ??
+            serverHints.chunkSizeBytes ??
             envInt('PC_DEFAULT_CHUNK_MAX_BYTES', 5 * 1024 * 1024);
-        const chunkFiles = serverHints.maxFilesPerChunk ??
-            session.maxFilesPerChunk ??
+        const chunkFiles = session.maxFilesPerChunk ??
+            serverHints.maxFilesPerChunk ??
             envInt('PC_DEFAULT_CHUNK_MAX_FILES', 200);
         // Step 2 — split the file map into chunks bounded by both byte size
         // and file count.
@@ -198,6 +202,13 @@ class ComplianceApiClient {
         // Step 4 — finalize. Server flips status to COMPLETED, computes the
         // summary, and triggers reconcile against the previous scan.
         const finalResult = (await this.post(`/v1/compliance/scans/${session.scanId}/complete`, {}));
+        // Sort findings by a stable (path, line, ruleId) key so two
+        // identical runs return findings in the same order regardless of
+        // which chunk's network response arrived first. Without this,
+        // SARIF/JSON output diff-noises across runs and downstream
+        // consumers (e.g. PR-comment dedup) can't rely on positional
+        // identity.
+        sortFindingsStable(allFindings);
         // Derive findingsCount from the client-accumulated array so
         // findings.length === findingsCount always holds. The server's
         // /complete returns its own findingsCount which can disagree if it
@@ -207,9 +218,9 @@ class ComplianceApiClient {
         const finalCount = allFindings.length;
         if (typeof finalResult.findingsCount === 'number' &&
             finalResult.findingsCount !== finalCount) {
-            process.stderr.write(`Note: server reported findingsCount=${finalResult.findingsCount} ` +
+            logger.warn(`server reported findingsCount=${finalResult.findingsCount} ` +
                 `but client accumulated ${finalCount} findings across chunks ` +
-                `(server may have deduped or filtered at finalize).\n`);
+                `(server may have deduped or filtered at finalize).`);
         }
         return {
             scanId: session.scanId,
@@ -369,6 +380,61 @@ function jitteredBackoff(baseMs) {
 }
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
+}
+/**
+ * Minimal stderr-only logger. The OSS CLI is a thin client and doesn't
+ * pull in pino/winston, but we still want a single replaceable surface
+ * for diagnostic output rather than direct `console.warn` /
+ * `process.stderr.write` calls scattered through the client. Set
+ * `PC_SUPPRESS_WARNINGS=1` to silence all warnings, or replace
+ * `logger` here with a richer implementation if downstream consumers
+ * want structured logs.
+ */
+const logger = {
+    warn(message) {
+        if (process.env.PC_SUPPRESS_WARNINGS)
+            return;
+        process.stderr.write(`prodcycle: ${message}\n`);
+    },
+};
+function findingSortKey(f) {
+    if (!f || typeof f !== 'object')
+        return ['', 0, ''];
+    const v = f;
+    const path = typeof v.resourcePath === 'string'
+        ? v.resourcePath
+        : typeof v.path === 'string'
+            ? v.path
+            : '';
+    const line = typeof v.startLine === 'number'
+        ? v.startLine
+        : typeof v.line === 'number'
+            ? v.line
+            : 0;
+    const ruleId = typeof v.ruleId === 'string'
+        ? v.ruleId
+        : typeof v.controlId === 'string'
+            ? v.controlId
+            : '';
+    return [path, line, ruleId];
+}
+/**
+ * Sort findings in place by (path, line, ruleId) so two identical
+ * runs return findings in the same order regardless of which chunk's
+ * network response arrived first.
+ */
+function sortFindingsStable(findings) {
+    findings.sort((a, b) => {
+        const [ap, al, ar] = findingSortKey(a);
+        const [bp, bl, br] = findingSortKey(b);
+        if (ap !== bp)
+            return ap < bp ? -1 : 1;
+        if (al !== bl)
+            return al - bl;
+        if (ar !== br)
+            return ar < br ? -1 : 1;
+        return 0;
+    });
 }
 async function safeReadJson(response) {
     try {
