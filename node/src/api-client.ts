@@ -469,16 +469,24 @@ function retryBackoffMs(attempt: number): number {
  * the header is missing/unparseable.
  */
 /**
- * Detect the API's envelope shape strictly: a plain object whose
- * `status` is the discriminant string "success" or "error" and that
- * carries a `data` payload. Anything else (including a bare scan result
- * that happens to contain `status: "PASSED"` and a `data` key) is
- * passed through unchanged so we don't silently drop top-level fields.
+ * Detect the API's *success* envelope shape strictly: a plain object
+ * whose `status` is exactly "success" and that carries a `data`
+ * payload. We deliberately do NOT match `status: "error"` here because
+ * `isApiEnvelope` is only consulted on the 2xx branch — accepting an
+ * error envelope on a 200 response would silently return `null as T`
+ * to the caller without ever raising, so downstream code would see
+ * `passed: undefined` with no signal that anything went wrong. Non-2xx
+ * error envelopes are handled by the explicit error path below.
+ *
+ * The strict-discriminant check is also necessary because `ScanResult`
+ * itself has a `status` field (PASSED/FAILED/IN_PROGRESS) and an open
+ * index signature, so a bare scan result with a `data` key would be
+ * misidentified as an envelope and have its top-level fields dropped.
  */
-function isApiEnvelope(value: unknown): value is { status: 'success' | 'error'; data: unknown } {
+function isApiEnvelope(value: unknown): value is { status: 'success'; data: unknown } {
   if (!value || typeof value !== 'object') return false;
   const v = value as Record<string, unknown>;
-  return (v.status === 'success' || v.status === 'error') && 'data' in v;
+  return v.status === 'success' && 'data' in v;
 }
 
 function parseRetryAfter(value: string | null): number | null {
