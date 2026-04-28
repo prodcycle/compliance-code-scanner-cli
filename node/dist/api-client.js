@@ -68,6 +68,17 @@ const DEFAULT_CHUNK_MAX_FILES = envInt('PC_DEFAULT_CHUNK_MAX_FILES', 200);
  */
 const ASYNC_POLL_INTERVAL_MS = envInt('PC_ASYNC_POLL_INTERVAL_MS', 2000);
 const ASYNC_POLL_TIMEOUT_MS = envInt('PC_ASYNC_POLL_TIMEOUT_MS', 10 * 60 * 1000);
+/**
+ * Keys in `options.config` that route client-side behavior (sync /
+ * async / chunked dispatch, chunk sizing) and MUST NOT be forwarded to
+ * the server. Some endpoints validate `options` strictly and would 400
+ * on unknown keys, so leaking these would silently break every call.
+ */
+const CLIENT_ONLY_CONFIG_KEYS = new Set([
+    'mode',
+    'chunkMaxBytes',
+    'chunkMaxFiles',
+]);
 class ComplianceApiClient {
     apiUrl;
     apiKey;
@@ -206,15 +217,26 @@ class ComplianceApiClient {
                 break;
             await sleep(ASYNC_POLL_INTERVAL_MS);
         }
-        throw new Error(`Async validate scan ${scanId} did not complete within ${ASYNC_POLL_TIMEOUT_MS / 1000}s. Re-run with the same scanId to keep polling: pc scans get ${scanId}`);
+        throw new Error(`Async validate scan ${scanId} did not complete within ${ASYNC_POLL_TIMEOUT_MS / 1000}s. Re-run with the same scanId to keep polling: prodcycle scans ${scanId}`);
     }
     // ─── Internals ──────────────────────────────────────────────────────────
     buildOptions(options) {
-        return {
+        const merged = {
             severity_threshold: options.severityThreshold,
             fail_on: options.failOn,
-            ...options.config,
         };
+        if (options.config && typeof options.config === 'object') {
+            // Strip client-routing keys (mode / chunkMaxBytes / chunkMaxFiles)
+            // before forwarding — they steer this SDK, not the server. The
+            // server's `options` schema may reject unknown keys strictly, in
+            // which case leaking these would cause 400s on every call.
+            for (const [key, value] of Object.entries(options.config)) {
+                if (CLIENT_ONLY_CONFIG_KEYS.has(key))
+                    continue;
+                merged[key] = value;
+            }
+        }
+        return merged;
     }
     /**
      * Single HTTP request with:

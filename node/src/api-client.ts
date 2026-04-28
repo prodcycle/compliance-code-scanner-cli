@@ -124,6 +124,18 @@ const ASYNC_POLL_TIMEOUT_MS = envInt(
   10 * 60 * 1000, // 10 minutes
 );
 
+/**
+ * Keys in `options.config` that route client-side behavior (sync /
+ * async / chunked dispatch, chunk sizing) and MUST NOT be forwarded to
+ * the server. Some endpoints validate `options` strictly and would 400
+ * on unknown keys, so leaking these would silently break every call.
+ */
+const CLIENT_ONLY_CONFIG_KEYS = new Set([
+  'mode',
+  'chunkMaxBytes',
+  'chunkMaxFiles',
+]);
+
 export class ComplianceApiClient {
   private apiUrl: string;
   private apiKey: string;
@@ -319,18 +331,28 @@ export class ComplianceApiClient {
     throw new Error(
       `Async validate scan ${scanId} did not complete within ${
         ASYNC_POLL_TIMEOUT_MS / 1000
-      }s. Re-run with the same scanId to keep polling: pc scans get ${scanId}`,
+      }s. Re-run with the same scanId to keep polling: prodcycle scans ${scanId}`,
     );
   }
 
   // ─── Internals ──────────────────────────────────────────────────────────
 
   private buildOptions(options: ScanOptions): Record<string, unknown> {
-    return {
+    const merged: Record<string, unknown> = {
       severity_threshold: options.severityThreshold,
       fail_on: options.failOn,
-      ...options.config,
     };
+    if (options.config && typeof options.config === 'object') {
+      // Strip client-routing keys (mode / chunkMaxBytes / chunkMaxFiles)
+      // before forwarding — they steer this SDK, not the server. The
+      // server's `options` schema may reject unknown keys strictly, in
+      // which case leaking these would cause 400s on every call.
+      for (const [key, value] of Object.entries(options.config)) {
+        if (CLIENT_ONLY_CONFIG_KEYS.has(key)) continue;
+        merged[key] = value;
+      }
+    }
+    return merged;
   }
 
   /**
