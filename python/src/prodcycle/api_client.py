@@ -255,12 +255,21 @@ class ComplianceApiClient:
         scan_id = kickoff["scanId"]
         deadline = time.monotonic() + ASYNC_POLL_TIMEOUT_S
 
-        while time.monotonic() < deadline:
+        # Always poll at least once, and re-check the deadline AFTER the
+        # blocking get_scan() returns rather than only at loop top — a
+        # single stalled get_scan() could otherwise extend wall-clock
+        # well past ASYNC_POLL_TIMEOUT_S (a stuck call sleeps up to
+        # REQUEST_TIMEOUT_S on its own). Belt-and-suspenders: also check
+        # before sleeping so a scan that completes during the trailing
+        # sleep window isn't reported as a timeout.
+        while True:
             scan = self.get_scan(scan_id)
             if scan.get("status") in ("COMPLETED", "FAILED"):
                 if "scanId" not in scan:
                     scan["scanId"] = scan_id
                 return scan
+            if time.monotonic() >= deadline:
+                break
             time.sleep(ASYNC_POLL_INTERVAL_S)
 
         raise Exception(
@@ -350,9 +359,12 @@ class ComplianceApiClient:
                     f"Failed to connect to ProdCycle API: {err.reason}"
                 )
 
-        # Loop exited via continue with no successful response.
-        raise Exception(
-            f"Exhausted retries without a response: {last_error}"
+        # Unreachable in practice: every iteration returns, raises, or
+        # continues. Kept solely so static analysis can tell that the
+        # function always returns or raises (mypy / type-checkers).
+        raise AssertionError(  # pragma: no cover
+            f"_request loop exited without returning or raising "
+            f"(last_error={last_error})"
         )
 
 
