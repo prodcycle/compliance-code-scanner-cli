@@ -12,6 +12,7 @@ type Format = 'json' | 'sarif' | 'table' | 'prompt';
 
 const KNOWN_COMMANDS = new Set([
   'scan',
+  'scans',
   'gate',
   'hook',
   'init',
@@ -101,6 +102,14 @@ program
   .option('--output <file>', 'Write report to file')
   .option('--api-url <url>', 'Compliance API base URL (or PC_API_URL env)')
   .option('--api-key <key>', 'API key for compliance API (or PC_API_KEY env)')
+  .option(
+    '--async',
+    'Use the async-validate flow (server returns 202 immediately; CLI polls until COMPLETED). Useful for large scans where holding a connection isn’t practical.',
+  )
+  .option(
+    '--chunked',
+    'Force the chunked-session flow regardless of payload size. The default already auto-falls-back to chunked when /validate returns 413 with a chunked-endpoint suggestion.',
+  )
   .action(async (repoPath: string | undefined, opts: Record<string, any>) => {
     try {
       const target = repoPath ?? '.';
@@ -108,7 +117,22 @@ program
       const failOn = parseList(opts.failOn) ?? ['critical', 'high'];
       const format = (opts.format ?? 'table') as Format;
 
-      console.error(`Scanning ${path.resolve(target)} for ${frameworks.join(', ')}...`);
+      // --async and --chunked are mutually exclusive; pick the explicit
+      // mode if either flag is set, otherwise let `scan()` pick (sync
+      // with auto-fallback to chunked on 413).
+      let mode: 'sync' | 'async' | 'chunked' = 'sync';
+      if (opts.async && opts.chunked) {
+        console.error('scan: --async and --chunked are mutually exclusive.');
+        process.exit(2);
+      }
+      if (opts.async) mode = 'async';
+      else if (opts.chunked) mode = 'chunked';
+
+      console.error(
+        `Scanning ${path.resolve(target)} for ${frameworks.join(', ')}` +
+          (mode === 'sync' ? '' : ` (${mode} mode)`) +
+          '...',
+      );
 
       const response = await scan({
         repoPath: target,
@@ -120,6 +144,7 @@ program
           exclude: parseList(opts.exclude),
           apiUrl: opts.apiUrl,
           apiKey: opts.apiKey,
+          config: { mode },
         },
       });
 
@@ -177,6 +202,50 @@ program
       process.exit(response.exitCode);
     } catch (error: any) {
       console.error(`\u2717 Error: ${error.message}`);
+      process.exit(2);
+    }
+  });
+
+// ── scans ───────────────────────────────────────────────────────────────────
+// Fetch the current status / final result of any scan by ID. Useful with
+// `--async` to resume a poll loop after a CI step boundary, or to inspect
+// a chunked session that was abandoned mid-flight.
+program
+  .command('scans <scanId>')
+  .description('Get the status + findings of a scan by ID')
+  .option('--format <format>', 'Output format: json, sarif, table, prompt', 'json')
+  .option('--output <file>', 'Write report to file')
+  .option('--api-url <url>', 'Compliance API base URL (or PC_API_URL env)')
+  .option('--api-key <key>', 'API key for compliance API (or PC_API_KEY env)')
+  .action(async (scanId: string, opts: Record<string, any>) => {
+    try {
+      const format = (opts.format ?? 'json') as Format;
+      const { ComplianceApiClient } = await import('./api-client');
+      const client = new ComplianceApiClient(opts.apiUrl, opts.apiKey);
+      const scan = await client.getScan(scanId);
+
+      const payload = {
+        scanId,
+        passed: scan.passed,
+        status: scan.status ?? 'COMPLETED',
+        findings: scan.findings ?? [],
+        summary: scan.summary,
+        exitCode: scan.passed ? 0 : 1,
+      };
+
+      // Use the same renderer as `scan` so format=table/sarif/prompt all work.
+      writeOutput(renderReport(payload, format), opts.output);
+      // Exit 2 if scan is still in progress — the CLI run shouldn't gate on
+      // an indeterminate result.
+      if (scan.status === 'IN_PROGRESS') {
+        console.error(
+          `Scan ${scanId} is still IN_PROGRESS. Re-run the same command to keep polling, or use 'pc scan --async' to wait for completion.`,
+        );
+        process.exit(2);
+      }
+      process.exit(payload.exitCode);
+    } catch (error: any) {
+      console.error(`✗ Error: ${error.message}`);
       process.exit(2);
     }
   });

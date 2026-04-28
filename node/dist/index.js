@@ -23,32 +23,51 @@ __exportStar(require("./formatters/table"), exports);
 __exportStar(require("./formatters/prompt"), exports);
 __exportStar(require("./formatters/sarif"), exports);
 /**
- * Scan a repository by collecting files and sending them to the API
+ * Scan a repository by collecting files and sending them to the API.
+ *
+ * Modes (selectable via `options.config`):
+ *   - default: synchronous validate; auto-falls-back to chunked sessions
+ *     if the server returns 413 with `suggestedEndpoint=/v1/compliance/scans`
+ *   - `mode: 'async'`: kicks off a 202 async-validate and polls until
+ *     terminal (returns same shape as default)
+ *   - `mode: 'chunked'`: explicit chunked-session flow regardless of size
  */
 async function scan(params) {
     const { repoPath, frameworks = ['soc2'], options = {} } = params;
-    // Collect files
     const files = await (0, fs_1.collectFiles)(repoPath, options.include, options.exclude);
     if (Object.keys(files).length === 0) {
         return {
             passed: true,
             exitCode: 0,
             findings: [],
-            report: null
+            report: null,
+            summary: undefined,
         };
     }
     const client = new api_client_1.ComplianceApiClient(options.apiUrl, options.apiKey);
-    const response = await client.validate(files, frameworks, options);
+    const mode = options.config?.mode ?? 'sync';
+    let response;
+    if (mode === 'async') {
+        response = await client.validateAndPoll(files, frameworks, options);
+    }
+    else if (mode === 'chunked') {
+        response = await client.validateChunked(files, frameworks, options);
+    }
+    else {
+        response = await client.validate(files, frameworks, options);
+    }
     return {
+        scanId: response.scanId,
         passed: response.passed,
         exitCode: response.passed ? 0 : 1,
-        findings: response.findings || [],
-        report: response.report, // The API should return the full report object if requested, or we synthesize it
-        summary: response.summary
+        findings: response.findings ?? [],
+        report: response.report ?? null,
+        summary: response.summary,
     };
 }
 /**
- * Gate code strings directly without writing to disk
+ * Gate code strings directly without writing to disk (low-latency hook
+ * endpoint, used by coding-agent post-edit hooks).
  */
 async function gate(options) {
     const { files, frameworks = ['soc2'], ...scanOpts } = options;
@@ -57,8 +76,8 @@ async function gate(options) {
     return {
         passed: response.passed,
         exitCode: response.passed ? 0 : 1,
-        findings: response.findings || [],
+        findings: response.findings ?? [],
         prompt: response.prompt,
-        summary: response.summary
+        summary: response.summary,
     };
 }

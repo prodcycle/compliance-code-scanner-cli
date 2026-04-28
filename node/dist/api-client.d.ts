@@ -16,108 +16,123 @@ export interface GateOptions {
     apiUrl?: string;
     config?: Record<string, unknown>;
 }
-export declare class ComplianceApiClient {
-    private apiUrl;
-    private apiKey;
-    private retryOptions;
-    private chunkConcurrency;
-    constructor(apiUrl?: string, apiKey?: string, options?: {
-        retry?: RetryOptions;
-        chunkConcurrency?: number;
-    });
-    /**
-     * Run a CI/PR validation scan. Auto-falls-back to the chunked-session
-     * path (`POST /v1/compliance/scans`) when the request is too large for
-     * the single-payload `/validate` endpoint — the server tells us so via
-     * a 413 with `suggestedEndpoint: '/v1/compliance/scans'` (Phase 1c).
-     */
-    validate(files: Record<string, string>, frameworks: string[], options?: ScanOptions): Promise<ScanApiResponse>;
-    /**
-     * Coding agent file-write hook. Single-payload only — agents send 1
-     * file at a time, so chunking would be pure overhead.
-     */
-    hook(files: Record<string, string>, frameworks: string[], options?: ScanOptions): Promise<ScanApiResponse>;
-    /**
-     * Run a scan via the chunked-session endpoint. Splits files into chunks
-     * sized for the server's `/validate` cap, uploads them with bounded
-     * concurrency, and finalizes. Returns a shape compatible with `/validate`
-     * so callers don't need to special-case.
-     */
-    scanChunked(files: Record<string, string>, frameworks: string[], options?: ScanOptions, serverHints?: {
-        chunkSizeBytes?: number | undefined;
-        maxFilesPerChunk?: number | undefined;
-    }): Promise<ChunkedScanResult>;
-    /**
-     * Compute the SHA-256 of file content. Exposed so callers can pre-hash
-     * locally and decide what to send (e.g. skip files whose hash hasn't
-     * changed since the last scan). The server's per-content cache uses
-     * the same algorithm, so a hit on the client-side cache is a hit on
-     * the server-side cache.
-     */
-    static sha256(content: string): string;
-    /**
-     * Internal POST with retry/backoff on transient errors.
-     *
-     * Retries:
-     *   - 429 Too Many Requests — honor `Retry-After` header if present
-     *   - 503 Service Unavailable — same
-     *   - Network errors (fetch throws) — retry with backoff
-     *
-     * Does NOT retry:
-     *   - 4xx other than 429 — caller's bug; surface immediately
-     *   - 5xx other than 503 — server bug; surface immediately
-     *   - 413 Payload Too Large — caller is expected to handle this (e.g.
-     *     fall back to chunked)
-     */
-    private post;
-}
-export interface RetryOptions {
-    /** Total attempts including the first try. Default 4. */
-    maxAttempts?: number;
-    /** Backoff base (ms) for the first retry. Default 500. */
-    initialDelayMs?: number;
-    /** Cap on backoff (ms). Default 30000. */
-    maxDelayMs?: number;
-    /** Multiplier between attempts. Default 2 (full jitter applied). */
-    backoffMultiplier?: number;
-}
-/**
- * Shape returned by /validate, /hook, and the chunked-session orchestration.
- * Every caller can rely on `passed` + `findings` + `summary` regardless of
- * which path actually ran. Extra fields like `prompt` and `report` may be
- * populated depending on the server's options.
- */
-export interface ScanApiResponse {
+export interface ScanResult {
+    scanId?: string;
     passed: boolean;
     findingsCount?: number;
     findings?: unknown[];
     summary?: unknown;
     prompt?: string;
-    report?: unknown;
-    scanId?: string;
+    status?: 'IN_PROGRESS' | 'COMPLETED' | 'FAILED';
+    [key: string]: unknown;
 }
-export interface ChunkedScanResult {
-    scanId: string;
-    passed: boolean;
-    findingsCount: number;
-    findings: unknown[];
-    summary: unknown;
-    durationMs: number;
-    /** Files served from the per-content cache (no OPA invocation). */
-    cachedFiles: number;
-    /** Files that needed a fresh OPA scan. */
-    scannedFiles: number;
+interface ApiErrorBody {
+    status: 'error';
+    statusCode: number;
+    error?: {
+        type?: string;
+        message?: string;
+        suggestion?: string;
+        details?: {
+            maxBytes?: number;
+            maxFiles?: number;
+            chunkSizeBytes?: number;
+            receivedBytes?: number;
+            suggestedEndpoint?: string;
+            [key: string]: unknown;
+        };
+    };
 }
 /**
- * Split a file map into chunks bounded by total byte size AND file count.
- * Files larger than `maxBytes` are placed in their own chunk (the server
- * will 413 them with a per-file size error — surfacing that at the
- * server boundary keeps client logic simple).
+ * Error thrown for any non-2xx response. Carries the parsed body + status so
+ * callers can branch on `details.suggestedEndpoint` (413 → chunked-session
+ * fallback) or `Retry-After` (429 / 503 → backoff + retry).
  */
-export declare function splitIntoChunks(files: Record<string, string>, maxBytes: number, maxFiles: number): Record<string, string>[];
-/**
- * Run an async task over each item with at most `concurrency` workers
- * in flight. Errors propagate; remaining tasks are abandoned (the
- * server-side session expires via TTL — no client-side cleanup needed).
- */
-export declare function runWithConcurrency<T>(concurrency: number, items: T[], fn: (item: T) => Promise<void>): Promise<void>;
+export declare class ApiError extends Error {
+    readonly statusCode: number;
+    readonly body: ApiErrorBody | null;
+    readonly retryAfterSeconds: number | null;
+    constructor(statusCode: number, body: ApiErrorBody | null, retryAfterSeconds: number | null, message: string);
+}
+export declare class ComplianceApiClient {
+    private apiUrl;
+    private apiKey;
+    constructor(apiUrl?: string, apiKey?: string);
+    /**
+     * Synchronous validate. On a 413 with `details.suggestedEndpoint ===
+     * '/v1/compliance/scans'`, silently falls back to the chunked-session
+     * flow so large-repo CI jobs don't have to know the difference.
+     */
+    validate(files: Record<string, string>, frameworks: string[], options?: ScanOptions): Promise<ScanResult>;
+    /**
+     * Hook endpoint — small per-write call from coding agents. No
+     * suggestedEndpoint fallback because /hook keeps the historical 50 MB
+     * ceiling; if a single hook write exceeds that, the caller's batching
+     * is the bug to fix.
+     */
+    hook(files: Record<string, string>, frameworks: string[], options?: ScanOptions): Promise<ScanResult>;
+    /**
+     * Open a chunked scan session. Returns a `scanId` that subsequent
+     * `appendChunk` / `completeSession` calls reference. Server-side TTL is
+     * 30 minutes by default — abandoned sessions self-clean via the
+     * stale-session reaper.
+     */
+    openSession(frameworks: string[], options?: ScanOptions): Promise<{
+        scanId: string;
+        chunkSizeBytes: number;
+        maxFilesPerChunk: number;
+        expiresAt: string;
+    }>;
+    /**
+     * Append a chunk of files to an open session. Each call has its own
+     * /hook-style cap (50 MB / 2000 files). The server caches per-content
+     * findings, so re-scans of unchanged files are O(1).
+     */
+    appendChunk(scanId: string, files: Record<string, string>): Promise<{
+        filesScanned: number;
+        cachedFiles: number;
+        findingsAdded: number;
+    }>;
+    /**
+     * Finalize a chunked session: flips status to COMPLETED, computes
+     * summary + passed, returns final findings.
+     */
+    completeSession(scanId: string): Promise<ScanResult>;
+    /**
+     * High-level helper: open → append (in chunks) → complete. Returns the
+     * same shape as `validate()` so callers that auto-fallback don't have
+     * to special-case the result.
+     *
+     * Caller can pre-set `chunkMaxBytes` / `chunkMaxFiles` on `options.config`
+     * to override the conservative defaults.
+     */
+    validateChunked(files: Record<string, string>, frameworks: string[], options?: ScanOptions): Promise<ScanResult>;
+    /**
+     * Async-validate: returns a `scanId` immediately; caller polls
+     * `getScan(scanId)` until status is COMPLETED or FAILED. Useful for CI
+     * runners that don't want to hold a connection for a 60 s scan.
+     */
+    validateAsync(files: Record<string, string>, frameworks: string[], options?: ScanOptions): Promise<{
+        scanId: string;
+    }>;
+    /**
+     * Fetch the current state of any scan (sync, async, or chunked-session).
+     */
+    getScan(scanId: string): Promise<ScanResult>;
+    /**
+     * High-level helper: kicks off an async-validate, polls until terminal,
+     * returns the same shape as `validate()`.
+     */
+    validateAndPoll(files: Record<string, string>, frameworks: string[], options?: ScanOptions): Promise<ScanResult>;
+    private buildOptions;
+    /**
+     * Single HTTP request with:
+     *   - auth header
+     *   - 429/503 + Retry-After honoring (up to MAX_RETRY_ATTEMPTS)
+     *   - structured error with parsed body so callers can introspect
+     *     `details.suggestedEndpoint` etc.
+     */
+    private request;
+}
+export declare function chunkFiles(files: Record<string, string>, maxBytes: number, maxFiles: number): Record<string, string>[];
+export {};
