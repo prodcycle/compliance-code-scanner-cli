@@ -119,10 +119,15 @@ class ComplianceApiClient {
         catch (err) {
             const apiErr = err;
             if (apiErr.status === 413 && apiErr.details?.suggestedEndpoint === '/v1/compliance/scans') {
-                // Server says: too big for /validate, use chunked. Honor its size hint.
+                // Server says: too big for /validate, use chunked. Forward only
+                // the byte hint — `apiErr.details.maxFiles` is the /validate
+                // per-request file cap (~200), NOT the /chunks per-chunk file
+                // cap (~2000). Reusing it as `maxFilesPerChunk` would
+                // over-split into many tiny chunks; let scanChunked fall back
+                // to the session's reported `maxFilesPerChunk` (or the env-var
+                // default) instead.
                 const chunked = await this.scanChunked(files, frameworks, options, {
                     chunkSizeBytes: apiErr.details.chunkSizeBytes,
-                    maxFilesPerChunk: apiErr.details.maxFiles,
                 });
                 return {
                     passed: chunked.passed,
