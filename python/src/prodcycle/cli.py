@@ -128,27 +128,38 @@ def _cmd_scans(args):
     scan_data = client.get_scan(args.scan_id)
     fmt = args.format or 'json'
 
+    # Compute exit-code consistently for terminal vs in-progress scans
+    # so the JSON output and the process exit-code agree. Previously the
+    # JSON wrote `exitCode: 1` (compliance failure) for IN_PROGRESS scans
+    # while the process exited with 2 (still polling) — automated CI
+    # consumers parsing the JSON would misread the in-progress signal as
+    # a compliance failure.
+    in_progress = scan_data.get('status') == 'IN_PROGRESS'
+    if in_progress:
+        exit_code = 2
+    else:
+        exit_code = 0 if scan_data.get('passed') else 1
+
     payload = {
         'scanId': args.scan_id,
         'passed': scan_data.get('passed', False),
         'status': scan_data.get('status', 'COMPLETED'),
         'findings': scan_data.get('findings', []),
         'summary': scan_data.get('summary', {}),
-        'exitCode': 0 if scan_data.get('passed') else 1,
+        'exitCode': exit_code,
     }
 
     _write_output(_render(payload, fmt), args.output)
 
-    if scan_data.get('status') == 'IN_PROGRESS':
+    if in_progress:
         print(
             f"Scan {args.scan_id} is still IN_PROGRESS. Re-run the same command "
             f"to keep polling, or use 'prodcycle scan --async' to wait for "
             f"completion.",
             file=sys.stderr,
         )
-        sys.exit(2)
 
-    sys.exit(payload['exitCode'])
+    sys.exit(exit_code)
 
 
 def _cmd_gate(args):
