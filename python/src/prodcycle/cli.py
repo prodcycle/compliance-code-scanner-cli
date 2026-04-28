@@ -8,7 +8,7 @@ from prodcycle.formatters.table import format_table
 from prodcycle.formatters.sarif import format_sarif
 from prodcycle.formatters.prompt import format_prompt
 
-KNOWN_COMMANDS = {'scan', 'gate', 'hook', 'init', 'help', '--help', '-h', '--version', '-V'}
+KNOWN_COMMANDS = {'scan', 'scans', 'gate', 'hook', 'init', 'help', '--help', '-h', '--version', '-V'}
 
 
 def _inject_scan_default(argv):

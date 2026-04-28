@@ -11,6 +11,7 @@ import json
 import math
 import os
 import random
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -19,26 +20,55 @@ import urllib.request
 
 DEFAULT_API_URL = "https://api.prodcycle.com"
 
+
+def _env_int(name, fallback):
+    """Read a positive integer from an env var or fall back to a default.
+
+    Used for the timeout / retry knobs below so operators can tune the
+    client in CI without forking the SDK.
+    """
+    raw = os.environ.get(name)
+    if not raw:
+        return fallback
+    try:
+        parsed = int(raw)
+    except ValueError:
+        return fallback
+    return parsed if parsed > 0 else fallback
+
+
 # Maximum retry attempts for 429/503 responses. After this many tries we
 # give up and surface the error to the caller.
-MAX_RETRY_ATTEMPTS = 4
+MAX_RETRY_ATTEMPTS = _env_int("PC_MAX_RETRY_ATTEMPTS", 4)
 
 # Hard ceiling on Retry-After (seconds). Even if the server asks for more
 # than this we cap it so the CLI doesn't appear to hang indefinitely on a
 # misconfigured server.
-MAX_RETRY_AFTER_SECONDS = 300
+MAX_RETRY_AFTER_SECONDS = _env_int("PC_MAX_RETRY_AFTER_SECONDS", 300)
+
+# Per-request socket timeout. Without this `urllib.request.urlopen` would
+# block indefinitely on a stalled server, bypassing the retry cap and the
+# async-poll deadline. Default is 2 minutes — long enough for the largest
+# non-async sync `/validate` call.
+REQUEST_TIMEOUT_S = _env_int("PC_REQUEST_TIMEOUT_S", 120)
 
 # Conservative client-side chunk sizing for the chunked-session flow.
 # /chunks accepts up to 50 MB / 2000 files per request, but smaller chunks
 # shorten tail-latency on a single saturated chunk; the server's per-content
 # findings cache keeps re-scans of unchanged files O(1) regardless of chunk
 # size, so picking on the smaller side costs little.
-DEFAULT_CHUNK_MAX_BYTES = 5 * 1024 * 1024  # 5 MB
-DEFAULT_CHUNK_MAX_FILES = 200
+DEFAULT_CHUNK_MAX_BYTES = _env_int("PC_DEFAULT_CHUNK_MAX_BYTES", 5 * 1024 * 1024)
+DEFAULT_CHUNK_MAX_FILES = _env_int("PC_DEFAULT_CHUNK_MAX_FILES", 200)
 
 # Async-validate poll cadence.
-ASYNC_POLL_INTERVAL_S = 2
-ASYNC_POLL_TIMEOUT_S = 10 * 60  # 10 minutes
+ASYNC_POLL_INTERVAL_S = _env_int("PC_ASYNC_POLL_INTERVAL_S", 2)
+ASYNC_POLL_TIMEOUT_S = _env_int("PC_ASYNC_POLL_TIMEOUT_S", 10 * 60)
+
+# Keys in `options['config']` that route client-side behavior (sync / async
+# / chunked, chunk sizing) and MUST NOT be forwarded to the server. The
+# server's `options` schema rejects unknown keys strictly on some endpoints,
+# so leaking these would cause 400s rather than just being inert.
+_CLIENT_ONLY_CONFIG_KEYS = frozenset({"mode", "chunkMaxBytes", "chunkMaxFiles"})
 
 
 class ApiError(Exception):
@@ -63,8 +93,14 @@ class ComplianceApiClient:
         )
         self.api_key = api_key or os.environ.get("PC_API_KEY", "")
 
-        if not self.api_key and os.environ.get("PYTEST_CURRENT_TEST") is None:
-            print("Warning: PC_API_KEY is not set. API calls will likely fail.")
+        if (
+            not self.api_key
+            and os.environ.get("PYTEST_CURRENT_TEST") is None
+            and not os.environ.get("PC_SUPPRESS_WARNINGS")
+        ):
+            sys.stderr.write(
+                "Warning: PC_API_KEY is not set. API calls will likely fail.\n"
+            )
 
     # ─── Synchronous validate ────────────────────────────────────────────
 
@@ -243,7 +279,12 @@ class ComplianceApiClient:
         }
         config = options.get("config")
         if isinstance(config, dict):
-            opts_payload.update(config)
+            # Strip client-routing keys (mode / chunkMaxBytes / chunkMaxFiles)
+            # before forwarding — they steer this SDK, not the server, and
+            # leaking them produces 400s on endpoints with strict schemas.
+            opts_payload.update(
+                {k: v for k, v in config.items() if k not in _CLIENT_ONLY_CONFIG_KEYS}
+            )
         # Drop None values — server treats absent + null differently for
         # some keys (severity_threshold default is 'low'; absent uses
         # the workspace default).
@@ -263,7 +304,9 @@ class ComplianceApiClient:
             payload = json.dumps(data).encode("utf-8") if data is not None else None
 
             try:
-                with urllib.request.urlopen(req, data=payload) as response:
+                with urllib.request.urlopen(
+                    req, data=payload, timeout=REQUEST_TIMEOUT_S
+                ) as response:
                     body = response.read().decode("utf-8")
                     parsed = json.loads(body) if body else {}
                     return _unwrap_envelope(parsed)
