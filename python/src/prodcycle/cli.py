@@ -49,10 +49,40 @@ def _write_output(text, out_file):
         sys.stdout.write(text)
 
 
+def _is_ci_environment():
+    """Detect CI via well-known platform env vars. When CI is detected,
+    `--format` defaults to ``sarif`` so output drops into GitHub code
+    scanning / GitLab security dashboards / etc. with no extra wiring.
+    Heuristic, not load-bearing — if we miss a platform the user just
+    gets the same ``table`` default they'd have anyway.
+    """
+    return (
+        os.environ.get('CI') == 'true'
+        or os.environ.get('GITHUB_ACTIONS') == 'true'
+        or os.environ.get('GITLAB_CI') == 'true'
+        or os.environ.get('CIRCLECI') == 'true'
+        or os.environ.get('JENKINS_URL') is not None
+        or os.environ.get('BUILDKITE') == 'true'
+        or os.environ.get('TRAVIS') == 'true'
+        or os.environ.get('BITBUCKET_BUILD_NUMBER') is not None
+    )
+
+
 def _add_common_scan_args(parser):
-    parser.add_argument('--framework', default='soc2', help='Comma-separated framework IDs to evaluate')
-    parser.add_argument('--format', default='table', help='Output format: json, sarif, table, prompt')
-    parser.add_argument('--severity-threshold', default='low', help='Minimum severity to include in report')
+    # Default frameworks: all three. The unique value of this scanner is
+    # cross-framework evaluation in one pass; defaulting to ``soc2`` only
+    # hid the HIPAA + NIST CSF capability from users who never thought
+    # to override the flag.
+    parser.add_argument('--framework', default='soc2,hipaa,nist-csf', help='Comma-separated framework IDs to evaluate')
+    # Default format: ``table`` for interactive use, but auto-flipped to
+    # ``sarif`` when CI is detected (see _is_ci_environment) so dashboards
+    # pick up the report without extra wiring. Explicit --format wins.
+    parser.add_argument('--format', default=None, help='Output format: json, sarif, table, prompt (auto-defaults to sarif in CI)')
+    # Default severity-threshold: ``medium``. ``low`` includes too many
+    # tier-3 advisory findings that are typically noise unless the user
+    # explicitly opts in; ``high`` would hide medium-severity weak-crypto
+    # findings that ARE actionable.
+    parser.add_argument('--severity-threshold', default='medium', help='Minimum severity to include in report')
     parser.add_argument('--fail-on', default='critical,high', help='Comma-separated severities that cause non-zero exit')
     parser.add_argument('--include', help='Comma-separated glob patterns to include')
     parser.add_argument('--exclude', help='Comma-separated glob patterns to exclude')
@@ -78,9 +108,12 @@ def _add_common_scan_args(parser):
 
 def _cmd_scan(args):
     repo_path = args.repo_path or '.'
-    frameworks = _parse_list(args.framework) or ['soc2']
+    frameworks = _parse_list(args.framework) or ['soc2', 'hipaa', 'nist-csf']
     fail_on = _parse_list(args.fail_on) or ['critical', 'high']
-    fmt = args.format or 'table'
+    # Format resolution mirrors the Node CLI:
+    #   1. explicit --format wins
+    #   2. otherwise: sarif when CI is detected, table interactive
+    fmt = args.format or ('sarif' if _is_ci_environment() else 'table')
 
     if args.use_async and args.use_chunked:
         print('scan: --async and --chunked are mutually exclusive.', file=sys.stderr)

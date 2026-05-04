@@ -85,13 +85,53 @@ program
   )
   .version(PKG_VERSION);
 
+/**
+ * Detect CI environment via well-known env vars set by the major
+ * platforms. When CI is detected, default `--format` flips to `sarif`
+ * (so output drops straight into GitHub code scanning / GitLab security
+ * dashboards / etc. without extra configuration). Users can still
+ * override with `--format table|json|prompt`.
+ *
+ * The flip is opt-out (set `--format table` explicitly to keep the
+ * human-readable output in CI logs). Heuristic, not load-bearing — if
+ * we miss a CI platform here the user gets the same default they
+ * would have anyway (`table`), they just have to add `--format sarif`
+ * by hand.
+ */
+function isCiEnvironment(): boolean {
+  return (
+    process.env['CI'] === 'true' ||
+    process.env['GITHUB_ACTIONS'] === 'true' ||
+    process.env['GITLAB_CI'] === 'true' ||
+    process.env['CIRCLECI'] === 'true' ||
+    process.env['JENKINS_URL'] != null ||
+    process.env['BUILDKITE'] === 'true' ||
+    process.env['TRAVIS'] === 'true' ||
+    process.env['BITBUCKET_BUILD_NUMBER'] != null
+  );
+}
+
 // ── scan ────────────────────────────────────────────────────────────────────
 program
   .command('scan [repo_path]')
   .description('Scan a repository for compliance violations')
-  .option('--framework <ids>', 'Comma-separated framework IDs to evaluate', 'soc2')
-  .option('--format <format>', 'Output format: json, sarif, table, prompt', 'table')
-  .option('--severity-threshold <severity>', 'Minimum severity to include in report', 'low')
+  // Default frameworks: all three. The unique value of this scanner is
+  // cross-framework evaluation in one pass; defaulting to `soc2` only
+  // hid the HIPAA + NIST CSF capability from users who never thought
+  // to override the flag. If users need only one framework they can
+  // still pass `--framework soc2` explicitly.
+  .option('--framework <ids>', 'Comma-separated framework IDs to evaluate', 'soc2,hipaa,nist-csf')
+  // Default format: `table` for interactive use, but auto-flipped to
+  // `sarif` when CI is detected (see isCiEnvironment above) so GitHub
+  // Code Scanning / GitLab dashboards pick the report up without any
+  // extra wiring. The CLI's --format flag overrides the auto-flip.
+  .option('--format <format>', 'Output format: json, sarif, table, prompt (auto-defaults to sarif in CI)', undefined)
+  // Default severity-threshold: `medium`. `low` includes too many
+  // tier-3 advisory findings that are typically noise unless the user
+  // explicitly opts in; `high` would hide medium-severity weak-crypto
+  // findings that ARE actionable. Medium is the right balance for
+  // first-time users.
+  .option('--severity-threshold <severity>', 'Minimum severity to include in report', 'medium')
   .option(
     '--fail-on <levels>',
     'Comma-separated severities that cause non-zero exit',
@@ -113,9 +153,15 @@ program
   .action(async (repoPath: string | undefined, opts: Record<string, any>) => {
     try {
       const target = repoPath ?? '.';
-      const frameworks = parseList(opts.framework) ?? ['soc2'];
+      const frameworks = parseList(opts.framework) ?? ['soc2', 'hipaa', 'nist-csf'];
       const failOn = parseList(opts.failOn) ?? ['critical', 'high'];
-      const format = (opts.format ?? 'table') as Format;
+      // Format resolution:
+      //   1. explicit --format wins
+      //   2. otherwise: sarif when CI is detected, table when interactive
+      // SARIF in CI lets GitHub code scanning / GitLab security dashboards
+      // ingest results with zero extra configuration; table in interactive
+      // shells gives the human-readable summary first-time users expect.
+      const format = (opts.format ?? (isCiEnvironment() ? 'sarif' : 'table')) as Format;
 
       // --async and --chunked are mutually exclusive; pick the explicit
       // mode if either flag is set, otherwise let `scan()` pick (sync
