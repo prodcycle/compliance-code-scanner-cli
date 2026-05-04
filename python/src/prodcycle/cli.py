@@ -524,12 +524,16 @@ def _configure_agent(agent, directory, force, written_paths):
 def _cmd_init(args):
     directory = os.path.abspath(args.dir or '.')
     agents = _resolve_agents(args.agent, directory)
+    ci_providers = _resolve_ci_providers(getattr(args, 'ci', None))
 
-    if not agents:
+    if not agents and not ci_providers:
         print(
-            'init: no agents selected and none auto-detected. '
-            'Use --agent <name> to configure explicitly (claude, cursor, codex, '
-            'opencode, github-copilot, gemini-cli, or "all").',
+            'init: nothing to do. '
+            'Use --agent <name> to configure a coding agent (claude, cursor, '
+            'codex, opencode, github-copilot, gemini-cli, or "all"), and/or '
+            '--ci <provider> to scaffold CI workflows (github, gitlab, '
+            'circleci, or "all"). Without --agent the CLI also auto-detects '
+            'agents already in use.',
             file=sys.stderr,
         )
         sys.exit(2)
@@ -542,7 +546,195 @@ def _cmd_init(args):
         if status == 'failed':
             any_failed = True
 
+    for provider in ci_providers:
+        status, message = _configure_ci_provider(provider, directory, bool(args.force))
+        print(message)
+        if status == 'failed':
+            any_failed = True
+
     sys.exit(1 if any_failed else 0)
+
+
+ALL_CI_PROVIDERS = ['github', 'gitlab', 'circleci']
+
+
+def _resolve_ci_providers(user_choice):
+    if not user_choice:
+        return []
+    parsed = _parse_list(user_choice) or []
+    if parsed == ['all']:
+        return list(ALL_CI_PROVIDERS)
+    valid = []
+    for name in parsed:
+        if name in ALL_CI_PROVIDERS:
+            valid.append(name)
+        else:
+            print(f'init: unknown CI provider "{name}" — ignoring', file=sys.stderr)
+    return valid
+
+
+def _configure_ci_provider(provider, directory, force):
+    if provider == 'github':
+        return _write_ci_file(
+            provider,
+            directory,
+            os.path.join('.github', 'workflows', 'prodcycle.yml'),
+            _GITHUB_WORKFLOW,
+            force,
+        )
+    if provider == 'gitlab':
+        return _write_ci_file(
+            provider, directory, '.gitlab-ci.prodcycle.yml', _GITLAB_WORKFLOW, force,
+        )
+    if provider == 'circleci':
+        return _write_ci_file(
+            provider,
+            directory,
+            os.path.join('.circleci', 'prodcycle.yml'),
+            _CIRCLECI_WORKFLOW,
+            force,
+        )
+    return ('failed', f'[ci:{provider}] unknown provider')
+
+
+def _write_ci_file(provider, directory, rel_path, content, force):
+    full_path = os.path.join(directory, rel_path)
+    if os.path.exists(full_path) and not force:
+        return (
+            'already',
+            f'[ci:{provider}] {rel_path} already exists. Use --force to overwrite.',
+        )
+    parent = os.path.dirname(full_path)
+    if parent and not os.path.exists(parent):
+        os.makedirs(parent, exist_ok=True)
+    with open(full_path, 'w', encoding='utf-8') as f:
+        f.write(content)
+    if provider == 'gitlab':
+        followup = f"Include it from .gitlab-ci.yml: `include: '{rel_path}'`. "
+    elif provider == 'circleci':
+        followup = 'Reference it from .circleci/config.yml or merge the contents in. '
+    else:
+        followup = ''
+    return (
+        'installed',
+        f'[ci:{provider}] wrote {full_path}. '
+        f'{followup}'
+        f'Set PC_API_KEY as a secret/variable in your {provider} project before the first run.',
+    )
+
+
+_GITHUB_WORKFLOW = '''name: Prodcycle Compliance
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Run Prodcycle compliance scan
+        env:
+          PC_API_KEY: ${{ secrets.PC_API_KEY }}
+        run: |
+          if [ -n "${{ github.base_ref }}" ]; then
+            git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
+            npx --yes prodcycle scan . \\
+              --pr "origin/${{ github.base_ref }}..HEAD" \\
+              --format sarif \\
+              --output prodcycle.sarif
+          else
+            npx --yes prodcycle scan . --format sarif --output prodcycle.sarif
+          fi
+      - name: Upload SARIF to GitHub Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: prodcycle.sarif
+          category: prodcycle
+'''
+
+_GITLAB_WORKFLOW = '''# Prodcycle compliance scan. Include from your main .gitlab-ci.yml:
+#   include:
+#     - local: .gitlab-ci.prodcycle.yml
+#
+# Set PC_API_KEY as a CI/CD variable (Settings → CI/CD → Variables) before
+# the first run. Mark it Masked + Protected.
+
+prodcycle:
+  stage: test
+  image: node:22-alpine
+  variables:
+    GIT_DEPTH: "0"
+  before_script:
+    - apk add --no-cache git
+  script:
+    - |
+      if [ "$CI_PIPELINE_SOURCE" = "merge_request_event" ]; then
+        git fetch --no-tags origin "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
+        npx --yes prodcycle scan . \\
+          --pr "origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME..HEAD" \\
+          --format sarif --output prodcycle.sarif
+      else
+        npx --yes prodcycle scan . --format sarif --output prodcycle.sarif
+      fi
+  artifacts:
+    when: always
+    paths:
+      - prodcycle.sarif
+    reports:
+      sast: prodcycle.sarif
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+'''
+
+_CIRCLECI_WORKFLOW = '''# Prodcycle compliance scan. To use this, either replace .circleci/config.yml
+# or include it as a continuation/orb. Minimum example:
+#
+#   version: 2.1
+#   workflows:
+#     compliance:
+#       jobs:
+#         - prodcycle-scan
+#
+# Set PC_API_KEY as a project environment variable in CircleCI before the
+# first run.
+
+version: 2.1
+jobs:
+  prodcycle-scan:
+    docker:
+      - image: cimg/node:22.0
+    steps:
+      - checkout
+      - run:
+          name: Run Prodcycle compliance scan
+          command: |
+            if [ -n "$CIRCLE_PULL_REQUEST" ] && [ -n "$CIRCLE_BRANCH" ]; then
+              BASE="${CIRCLE_BASE_BRANCH:-main}"
+              git fetch --no-tags origin "$BASE"
+              npx --yes prodcycle scan . \\
+                --pr "origin/$BASE..HEAD" \\
+                --format sarif --output prodcycle.sarif
+            else
+              npx --yes prodcycle scan . --format sarif --output prodcycle.sarif
+            fi
+      - store_artifacts:
+          path: prodcycle.sarif
+          destination: prodcycle-sarif
+'''
 
 
 def main():
@@ -595,13 +787,22 @@ def main():
     p_hook.set_defaults(func=_cmd_hook)
 
     # init
-    p_init = subparsers.add_parser('init', help='Configure compliance hooks for coding agents')
+    p_init = subparsers.add_parser(
+        'init', help='Configure compliance hooks for coding agents and/or CI workflows',
+    )
     p_init.add_argument(
         '--agent',
         help=(
             'Comma-separated agents to configure (claude, cursor, codex, opencode, '
             'github-copilot, gemini-cli). Use "all" to configure every agent. '
             'Default: auto-detect.'
+        ),
+    )
+    p_init.add_argument(
+        '--ci',
+        help=(
+            'Comma-separated CI providers to scaffold (github, gitlab, circleci). '
+            'Use "all" for every provider. Opt-in only — never auto-detected.'
         ),
     )
     p_init.add_argument('--force', action='store_true', help='Overwrite existing compliance hook entries')

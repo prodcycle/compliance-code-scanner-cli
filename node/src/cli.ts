@@ -360,10 +360,14 @@ async function collectHookFiles(
 // ── init ────────────────────────────────────────────────────────────────────
 program
   .command('init')
-  .description('Configure compliance hooks for coding agents')
+  .description('Configure compliance hooks for coding agents and/or CI workflows')
   .option(
     '--agent <agents>',
     'Comma-separated agents to configure (claude, cursor, codex, opencode, github-copilot, gemini-cli). Use "all" to configure every agent. Default: auto-detect.',
+  )
+  .option(
+    '--ci <providers>',
+    'Comma-separated CI providers to scaffold (github, gitlab, circleci). Use "all" for every provider. Opt-in only \u2014 never auto-detected.',
   )
   .option('--force', 'Overwrite existing compliance hook entries')
   .option('--dir <path>', 'Project directory to configure', '.')
@@ -371,12 +375,15 @@ program
     try {
       const dir = path.resolve(opts.dir ?? '.');
       const agents = resolveAgents(opts.agent, dir);
+      const ciProviders = resolveCiProviders(opts.ci);
 
-      if (agents.length === 0) {
+      if (agents.length === 0 && ciProviders.length === 0) {
         console.error(
-          'init: no agents selected and none auto-detected. ' +
-            'Use --agent <name> to configure explicitly (claude, cursor, codex, ' +
-            'opencode, github-copilot, gemini-cli, or "all").',
+          'init: nothing to do. ' +
+            'Use --agent <name> to configure a coding agent (claude, cursor, codex, ' +
+            'opencode, github-copilot, gemini-cli, or "all"), and/or --ci <provider> ' +
+            'to scaffold CI workflows (github, gitlab, circleci, or "all"). ' +
+            'Without --agent the CLI also auto-detects agents already in use.',
         );
         process.exit(2);
       }
@@ -385,6 +392,11 @@ program
       const writtenPaths = new Set<string>();
       for (const agent of agents) {
         const result = configureAgent(agent, dir, !!opts.force, writtenPaths);
+        process.stdout.write(result.message + '\n');
+        if (result.status === 'failed') anyFailed = true;
+      }
+      for (const provider of ciProviders) {
+        const result = configureCiProvider(provider, dir, !!opts.force);
         process.stdout.write(result.message + '\n');
         if (result.status === 'failed') anyFailed = true;
       }
@@ -710,6 +722,200 @@ function configureInstructionFile(
 function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
+
+// ── CI provider scaffolding ─────────────────────────────────────────────────
+
+type CiProvider = 'github' | 'gitlab' | 'circleci';
+
+const ALL_CI_PROVIDERS: CiProvider[] = ['github', 'gitlab', 'circleci'];
+
+function isCiProvider(name: string): name is CiProvider {
+  return (ALL_CI_PROVIDERS as string[]).includes(name);
+}
+
+function resolveCiProviders(userChoice: string | undefined): CiProvider[] {
+  if (!userChoice) return [];
+  const list = parseList(userChoice) ?? [];
+  if (list.length === 1 && list[0] === 'all') return ALL_CI_PROVIDERS.slice();
+  const valid: CiProvider[] = [];
+  for (const name of list) {
+    if (isCiProvider(name)) valid.push(name);
+    else console.error(`init: unknown CI provider "${name}" — ignoring`);
+  }
+  return valid;
+}
+
+function configureCiProvider(
+  provider: CiProvider,
+  dir: string,
+  force: boolean,
+): InitResult {
+  switch (provider) {
+    case 'github':
+      return writeCiFile(
+        provider,
+        dir,
+        path.join('.github', 'workflows', 'prodcycle.yml'),
+        GITHUB_WORKFLOW,
+        force,
+      );
+    case 'gitlab':
+      return writeCiFile(provider, dir, '.gitlab-ci.prodcycle.yml', GITLAB_WORKFLOW, force);
+    case 'circleci':
+      return writeCiFile(
+        provider,
+        dir,
+        path.join('.circleci', 'prodcycle.yml'),
+        CIRCLECI_WORKFLOW,
+        force,
+      );
+  }
+}
+
+function writeCiFile(
+  provider: CiProvider,
+  dir: string,
+  relPath: string,
+  content: string,
+  force: boolean,
+): InitResult {
+  const fullPath = path.join(dir, relPath);
+  if (fs.existsSync(fullPath) && !force) {
+    return {
+      status: 'already',
+      message: `[ci:${provider}] ${relPath} already exists. Use --force to overwrite.`,
+    };
+  }
+  const parent = path.dirname(fullPath);
+  if (!fs.existsSync(parent)) fs.mkdirSync(parent, { recursive: true });
+  fs.writeFileSync(fullPath, content);
+  const followup =
+    provider === 'gitlab'
+      ? `Include it from .gitlab-ci.yml: \`include: '${relPath}'\`. `
+      : provider === 'circleci'
+        ? `Reference it from .circleci/config.yml or merge the contents in. `
+        : '';
+  return {
+    status: 'installed',
+    message:
+      `[ci:${provider}] wrote ${fullPath}. ` +
+      followup +
+      `Set PC_API_KEY as a secret/variable in your ${provider} project before the first run.`,
+  };
+}
+
+const GITHUB_WORKFLOW = `name: Prodcycle Compliance
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Run Prodcycle compliance scan
+        env:
+          PC_API_KEY: \${{ secrets.PC_API_KEY }}
+        run: |
+          if [ -n "\${{ github.base_ref }}" ]; then
+            git fetch --no-tags --depth=1 origin "\${{ github.base_ref }}"
+            npx --yes prodcycle scan . \\
+              --pr "origin/\${{ github.base_ref }}..HEAD" \\
+              --format sarif \\
+              --output prodcycle.sarif
+          else
+            npx --yes prodcycle scan . --format sarif --output prodcycle.sarif
+          fi
+      - name: Upload SARIF to GitHub Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: prodcycle.sarif
+          category: prodcycle
+`;
+
+const GITLAB_WORKFLOW = `# Prodcycle compliance scan. Include from your main .gitlab-ci.yml:
+#   include:
+#     - local: .gitlab-ci.prodcycle.yml
+#
+# Set PC_API_KEY as a CI/CD variable (Settings → CI/CD → Variables) before
+# the first run. Mark it Masked + Protected.
+
+prodcycle:
+  stage: test
+  image: node:22-alpine
+  variables:
+    GIT_DEPTH: "0"
+  before_script:
+    - apk add --no-cache git
+  script:
+    - |
+      if [ "$CI_PIPELINE_SOURCE" = "merge_request_event" ]; then
+        git fetch --no-tags origin "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
+        npx --yes prodcycle scan . \\
+          --pr "origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME..HEAD" \\
+          --format sarif --output prodcycle.sarif
+      else
+        npx --yes prodcycle scan . --format sarif --output prodcycle.sarif
+      fi
+  artifacts:
+    when: always
+    paths:
+      - prodcycle.sarif
+    reports:
+      sast: prodcycle.sarif
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+`;
+
+const CIRCLECI_WORKFLOW = `# Prodcycle compliance scan. To use this, either replace .circleci/config.yml
+# or include it as a continuation/orb. Minimum example:
+#
+#   version: 2.1
+#   workflows:
+#     compliance:
+#       jobs:
+#         - prodcycle-scan
+#
+# Set PC_API_KEY as a project environment variable in CircleCI before the
+# first run.
+
+version: 2.1
+jobs:
+  prodcycle-scan:
+    docker:
+      - image: cimg/node:22.0
+    steps:
+      - checkout
+      - run:
+          name: Run Prodcycle compliance scan
+          command: |
+            if [ -n "$CIRCLE_PULL_REQUEST" ] && [ -n "$CIRCLE_BRANCH" ]; then
+              BASE="\${CIRCLE_BASE_BRANCH:-main}"
+              git fetch --no-tags origin "$BASE"
+              npx --yes prodcycle scan . \\
+                --pr "origin/$BASE..HEAD" \\
+                --format sarif --output prodcycle.sarif
+            else
+              npx --yes prodcycle scan . --format sarif --output prodcycle.sarif
+            fi
+      - store_artifacts:
+          path: prodcycle.sarif
+          destination: prodcycle-sarif
+`;
 
 function readStdin(): Promise<string> {
   return new Promise((resolve, reject) => {
