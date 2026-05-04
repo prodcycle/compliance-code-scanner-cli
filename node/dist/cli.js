@@ -35,6 +35,7 @@ var __importStar = (this && this.__importStar) || (function () {
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
 const commander_1 = require("commander");
+const child_process_1 = require("child_process");
 const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
 const index_1 = require("./index");
@@ -126,6 +127,7 @@ program
     .option('--api-key <key>', 'API key for compliance API (or PC_API_KEY env)')
     .option('--async', 'Use the async-validate flow (server returns 202 immediately; CLI polls until COMPLETED). Useful for large scans where holding a connection isn’t practical.')
     .option('--chunked', 'Force the chunked-session flow regardless of payload size. The default already auto-falls-back to chunked when /validate returns 413 with a chunked-endpoint suggestion.')
+    .option('--pr <range>', 'Scan only files changed in a git diff range (e.g. "origin/main..HEAD"). Cuts CI scan time on large repos by skipping unchanged files. Requires baseDir to be the git repo root.')
     .action(async (repoPath, opts) => {
     try {
         const target = repoPath ?? '.';
@@ -144,6 +146,20 @@ program
             mode = 'async';
         else if (opts.chunked)
             mode = 'chunked';
+        // --pr: restrict the scan to files in `git diff --name-only <range>`.
+        // Empty diff → exit 0 immediately (nothing to scan).
+        let include = parseList(opts.include);
+        if (opts.pr) {
+            const changed = computeChangedFiles(target, opts.pr);
+            if (changed.length === 0) {
+                console.error(`No files changed in range "${opts.pr}". Nothing to scan.`);
+                process.exit(0);
+            }
+            console.error(`--pr ${opts.pr}: restricting scan to ${changed.length} changed file(s).`);
+            // Use the diff list as exact-match include patterns. minimatch treats
+            // ordinary paths (no glob chars) as literal matches against relPath.
+            include = changed;
+        }
         console.error(`Scanning ${path.resolve(target)} for ${frameworks.join(', ')}` +
             (mode === 'sync' ? '' : ` (${mode} mode)`) +
             '...');
@@ -153,7 +169,7 @@ program
             options: {
                 severityThreshold: opts.severityThreshold,
                 failOn: failOn,
-                include: parseList(opts.include),
+                include,
                 exclude: parseList(opts.exclude),
                 apiUrl: opts.apiUrl,
                 apiKey: opts.apiKey,
@@ -604,6 +620,26 @@ function configureInstructionFile(agent, dir, relPath, force, writtenPaths) {
 }
 function escapeRegExp(s) {
     return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+/**
+ * Compute the list of files changed in a git diff range, relative to repo root.
+ * Filters to ACMR (Added/Copied/Modified/Renamed) so deleted files don't get
+ * scanned (they're not on disk anymore, and walk() would skip them anyway).
+ */
+function computeChangedFiles(repoPath, range) {
+    let stdout;
+    try {
+        stdout = (0, child_process_1.execFileSync)('git', ['-C', repoPath, 'diff', '--name-only', '--diff-filter=ACMR', range], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    }
+    catch (e) {
+        const stderr = e?.stderr?.toString?.() ?? e?.message ?? 'unknown error';
+        console.error(`--pr: git diff failed for range "${range}": ${stderr.trim()}`);
+        process.exit(2);
+    }
+    return stdout
+        .split('\n')
+        .map((s) => s.trim())
+        .filter(Boolean);
 }
 function readStdin() {
     return new Promise((resolve, reject) => {

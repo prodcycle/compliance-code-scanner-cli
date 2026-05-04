@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import subprocess
 import sys
 
 from prodcycle import scan, gate, __version__
@@ -49,6 +50,28 @@ def _write_output(text, out_file):
         sys.stdout.write(text)
 
 
+def _compute_changed_files(repo_path, pr_range):
+    """Return files changed in `git diff --name-only --diff-filter=ACMR <range>`,
+    relative to the git repo root. Filters out deletions so the scanner doesn't
+    chase paths that no longer exist on disk.
+    """
+    try:
+        result = subprocess.run(
+            ['git', '-C', repo_path, 'diff', '--name-only', '--diff-filter=ACMR', pr_range],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as e:
+        stderr = (e.stderr or '').strip() or str(e)
+        print(f'--pr: git diff failed for range "{pr_range}": {stderr}', file=sys.stderr)
+        sys.exit(2)
+    except FileNotFoundError:
+        print('--pr: git executable not found in PATH', file=sys.stderr)
+        sys.exit(2)
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
 def _add_common_scan_args(parser):
     parser.add_argument('--framework', default='soc2', help='Comma-separated framework IDs to evaluate')
     parser.add_argument('--format', default='table', help='Output format: json, sarif, table, prompt')
@@ -74,6 +97,15 @@ def _add_common_scan_args(parser):
         dest='use_chunked',
         help='Force the chunked-session flow regardless of payload size. Default already auto-falls-back to chunked when /validate returns 413.',
     )
+    parser.add_argument(
+        '--pr',
+        dest='pr_range',
+        help=(
+            'Scan only files changed in a git diff range (e.g. "origin/main..HEAD"). '
+            'Cuts CI scan time on large repos by skipping unchanged files. '
+            'Requires repo_path to be the git repo root.'
+        ),
+    )
 
 
 def _cmd_scan(args):
@@ -92,6 +124,23 @@ def _cmd_scan(args):
     else:
         mode = 'sync'
 
+    # --pr: restrict the scan to files in `git diff --name-only <range>`.
+    # Empty diff → exit 0 immediately (nothing to scan).
+    include = _parse_list(args.include)
+    if args.pr_range:
+        changed = _compute_changed_files(repo_path, args.pr_range)
+        if not changed:
+            print(
+                f'No files changed in range "{args.pr_range}". Nothing to scan.',
+                file=sys.stderr,
+            )
+            sys.exit(0)
+        print(
+            f'--pr {args.pr_range}: restricting scan to {len(changed)} changed file(s).',
+            file=sys.stderr,
+        )
+        include = changed
+
     suffix = '' if mode == 'sync' else f' ({mode} mode)'
     print(
         f"Scanning {os.path.abspath(repo_path)} for {', '.join(frameworks)}{suffix}...",
@@ -104,7 +153,7 @@ def _cmd_scan(args):
         options={
             'severityThreshold': args.severity_threshold,
             'failOn': fail_on,
-            'include': _parse_list(args.include),
+            'include': include,
             'exclude': _parse_list(args.exclude),
             'apiUrl': args.api_url,
             'apiKey': args.api_key,

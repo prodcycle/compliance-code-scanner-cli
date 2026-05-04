@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { Command } from 'commander';
+import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import { scan, gate } from './index';
@@ -110,6 +111,10 @@ program
     '--chunked',
     'Force the chunked-session flow regardless of payload size. The default already auto-falls-back to chunked when /validate returns 413 with a chunked-endpoint suggestion.',
   )
+  .option(
+    '--pr <range>',
+    'Scan only files changed in a git diff range (e.g. "origin/main..HEAD"). Cuts CI scan time on large repos by skipping unchanged files. Requires baseDir to be the git repo root.',
+  )
   .action(async (repoPath: string | undefined, opts: Record<string, any>) => {
     try {
       const target = repoPath ?? '.';
@@ -128,6 +133,25 @@ program
       if (opts.async) mode = 'async';
       else if (opts.chunked) mode = 'chunked';
 
+      // --pr: restrict the scan to files in `git diff --name-only <range>`.
+      // Empty diff → exit 0 immediately (nothing to scan).
+      let include = parseList(opts.include);
+      if (opts.pr) {
+        const changed = computeChangedFiles(target, opts.pr);
+        if (changed.length === 0) {
+          console.error(
+            `No files changed in range "${opts.pr}". Nothing to scan.`,
+          );
+          process.exit(0);
+        }
+        console.error(
+          `--pr ${opts.pr}: restricting scan to ${changed.length} changed file(s).`,
+        );
+        // Use the diff list as exact-match include patterns. minimatch treats
+        // ordinary paths (no glob chars) as literal matches against relPath.
+        include = changed;
+      }
+
       console.error(
         `Scanning ${path.resolve(target)} for ${frameworks.join(', ')}` +
           (mode === 'sync' ? '' : ` (${mode} mode)`) +
@@ -140,7 +164,7 @@ program
         options: {
           severityThreshold: opts.severityThreshold,
           failOn: failOn as any,
-          include: parseList(opts.include),
+          include,
           exclude: parseList(opts.exclude),
           apiUrl: opts.apiUrl,
           apiKey: opts.apiKey,
@@ -709,6 +733,30 @@ function configureInstructionFile(
 
 function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Compute the list of files changed in a git diff range, relative to repo root.
+ * Filters to ACMR (Added/Copied/Modified/Renamed) so deleted files don't get
+ * scanned (they're not on disk anymore, and walk() would skip them anyway).
+ */
+function computeChangedFiles(repoPath: string, range: string): string[] {
+  let stdout: string;
+  try {
+    stdout = execFileSync(
+      'git',
+      ['-C', repoPath, 'diff', '--name-only', '--diff-filter=ACMR', range],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+  } catch (e: any) {
+    const stderr = e?.stderr?.toString?.() ?? e?.message ?? 'unknown error';
+    console.error(`--pr: git diff failed for range "${range}": ${stderr.trim()}`);
+    process.exit(2);
+  }
+  return stdout
+    .split('\n')
+    .map((s) => s.trim())
+    .filter(Boolean);
 }
 
 function readStdin(): Promise<string> {
