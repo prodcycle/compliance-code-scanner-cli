@@ -87,6 +87,40 @@ echo '{"files": {"main.tf": "resource \"aws_s3_bucket\" ..."}}' \
   | prodcycle gate --framework soc2
 ```
 
+### GitHub Action
+
+This repo doubles as a first-party GitHub Action (`uses: prodcycle/cli@v1`). It runs `prodcycle scan` with sensible CI defaults and uploads SARIF to GitHub Code Scanning:
+
+```yaml
+# .github/workflows/compliance.yml
+name: Compliance
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  prodcycle:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write   # required for SARIF upload
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: prodcycle/cli@v1
+        with:
+          api-key: ${{ secrets.PC_API_KEY }}
+```
+
+On `pull_request` events the action auto-detects the base branch and runs a changed-files-only scan (`--pr origin/<base>..HEAD`). On push events it runs a full-repo scan. Override with `pr-range:` (set to `full` to force a whole-repo scan even on PRs).
+
+Inputs: `api-key`, `path`, `framework` (default `soc2,hipaa,nist-csf`), `severity-threshold` (default `medium`), `fail-on` (default `critical,high`), `pr-range`, `output`, `upload-sarif`, `version`. See `action.yml` for the full schema.
+
+For GitLab and CircleCI, run `prodcycle init --ci gitlab` (or `--ci circleci`) to scaffold a starter pipeline file.
+
 ### Programmatic API (TypeScript)
 
 ```typescript
