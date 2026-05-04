@@ -1,0 +1,169 @@
+name: 'Prodcycle Compliance Scan'
+description: >-
+  Run the Prodcycle multi-framework compliance scanner (SOC 2, HIPAA, NIST CSF)
+  on a repository and optionally upload SARIF to GitHub Code Scanning.
+author: 'Prodcycle'
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  api-key:
+    description: >-
+      Prodcycle API key. Create one at https://app.prodcycle.com/compliance.
+      Set as a repository secret (Settings -> Secrets and variables -> Actions)
+      and pass via `with: api-key: ${{ secrets.PC_API_KEY }}`.
+    required: true
+  api-url:
+    description: 'Prodcycle compliance API base URL. Default: https://compliance.prodcycle.com'
+    required: false
+    default: ''
+  path:
+    description: 'Path to the repo or sub-tree to scan. Default: . (repo root)'
+    required: false
+    default: '.'
+  framework:
+    description: >-
+      Comma-separated framework IDs to evaluate. Default: soc2,hipaa,nist-csf.
+    required: false
+    default: 'soc2,hipaa,nist-csf'
+  severity-threshold:
+    description: >-
+      Minimum severity to include in the report (low, medium, high, critical).
+      Default: medium.
+    required: false
+    default: 'medium'
+  fail-on:
+    description: >-
+      Comma-separated severities that cause the action (and the workflow step)
+      to fail. Default: critical,high.
+    required: false
+    default: 'critical,high'
+  pr-range:
+    description: >-
+      Git diff range to scope the scan to changed files (e.g. origin/main..HEAD).
+      If empty and the workflow is triggered by `pull_request`, the action
+      auto-fills `origin/<base_ref>..HEAD`. Set to "full" to force a whole-repo
+      scan even on PRs.
+    required: false
+    default: ''
+  output:
+    description: 'SARIF output path. Default: prodcycle.sarif'
+    required: false
+    default: 'prodcycle.sarif'
+  upload-sarif:
+    description: >-
+      If "true", upload the SARIF file to GitHub Code Scanning. Requires
+      `permissions: { security-events: write }` in the calling workflow.
+      Default: true.
+    required: false
+    default: 'true'
+  version:
+    description: >-
+      Version of the `prodcycle` npm package to install. Default: latest.
+    required: false
+    default: 'latest'
+  node-version:
+    description: 'Node.js version to install. Default: 22'
+    required: false
+    default: '22'
+
+outputs:
+  passed:
+    description: '"true" if the scan passed (no findings at or above fail-on); "false" otherwise.'
+    value: ${{ steps.scan.outputs.passed }}
+  sarif-path:
+    description: 'Absolute path to the SARIF report.'
+    value: ${{ steps.scan.outputs.sarif-path }}
+  findings-count:
+    description: 'Total number of findings in the report (informational; includes severities below fail-on).'
+    value: ${{ steps.scan.outputs.findings-count }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: Resolve diff range
+      id: range
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ "${{ inputs.pr-range }}" = "full" ]; then
+          echo "range=" >> "$GITHUB_OUTPUT"
+          echo "Forcing full-repo scan (pr-range=full)."
+          exit 0
+        fi
+        if [ -n "${{ inputs.pr-range }}" ]; then
+          echo "range=${{ inputs.pr-range }}" >> "$GITHUB_OUTPUT"
+          echo "Using user-provided range: ${{ inputs.pr-range }}"
+          exit 0
+        fi
+        if [ "${{ github.event_name }}" = "pull_request" ] || [ "${{ github.event_name }}" = "pull_request_target" ]; then
+          BASE="${{ github.base_ref }}"
+          if [ -n "$BASE" ]; then
+            git -C "${{ inputs.path }}" fetch --no-tags --depth=1 origin "$BASE" || true
+            echo "range=origin/${BASE}..HEAD" >> "$GITHUB_OUTPUT"
+            echo "Auto-detected PR base: origin/${BASE}..HEAD"
+            exit 0
+          fi
+        fi
+        echo "range=" >> "$GITHUB_OUTPUT"
+        echo "No PR context detected; running full-repo scan."
+
+    - name: Run Prodcycle scan
+      id: scan
+      shell: bash
+      env:
+        PC_API_KEY: ${{ inputs.api-key }}
+        PC_API_URL: ${{ inputs.api-url }}
+      run: |
+        set -uo pipefail
+        ARGS=(
+          "scan" "${{ inputs.path }}"
+          "--framework" "${{ inputs.framework }}"
+          "--severity-threshold" "${{ inputs.severity-threshold }}"
+          "--fail-on" "${{ inputs.fail-on }}"
+          "--format" "sarif"
+          "--output" "${{ inputs.output }}"
+        )
+        if [ -n "${{ steps.range.outputs.range }}" ]; then
+          ARGS+=("--pr" "${{ steps.range.outputs.range }}")
+        fi
+        echo "Running: npx --yes prodcycle@${{ inputs.version }} ${ARGS[*]}"
+        npx --yes "prodcycle@${{ inputs.version }}" "${ARGS[@]}"
+        SCAN_EXIT=$?
+
+        SARIF_PATH="$(cd "${{ inputs.path }}" && pwd)/${{ inputs.output }}"
+        if [ -f "${{ inputs.output }}" ]; then
+          SARIF_PATH="$(realpath "${{ inputs.output }}")"
+        fi
+        echo "sarif-path=${SARIF_PATH}" >> "$GITHUB_OUTPUT"
+
+        if [ "$SCAN_EXIT" = "0" ]; then
+          echo "passed=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "passed=false" >> "$GITHUB_OUTPUT"
+        fi
+
+        # Best-effort findings count from the SARIF file. Doesn't fail the
+        # step if SARIF is malformed — the scan exit code is the source of
+        # truth for pass/fail.
+        if [ -f "${SARIF_PATH}" ]; then
+          COUNT=$(node -e "try { const s = require('${SARIF_PATH}'); const n = (s.runs||[]).reduce((a,r)=>a+(r.results||[]).length,0); process.stdout.write(String(n)); } catch(e) { process.stdout.write('0'); }")
+          echo "findings-count=${COUNT}" >> "$GITHUB_OUTPUT"
+        else
+          echo "findings-count=0" >> "$GITHUB_OUTPUT"
+        fi
+
+        exit $SCAN_EXIT
+
+    - name: Upload SARIF to GitHub Code Scanning
+      if: always() && inputs.upload-sarif == 'true' && hashFiles(inputs.output) != ''
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: ${{ inputs.output }}
+        category: prodcycle
